@@ -1,0 +1,87 @@
+diff --git a/Cargo.toml b/Cargo.toml
+index 493991d..24e673e 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -73,6 +73,12 @@ debug = true
+ cosmic-protocols = { git = "https://github.com/pop-os/cosmic-protocols//", rev = "d0e95be" }
+ cosmic-client-toolkit = { git = "https://github.com/pop-os/cosmic-protocols//", rev = "d0e95be" }
+ 
++# Build against the kinetic-patched cosmic-comp-config so the `kinetic` and
++# `scroll_factor_per_app` fields on ScrollConfig are available to the UI.
++# Points at the sibling working clone patched by kinetic-scrolling.patch.
++[patch.'https://github.com/pop-os/cosmic-comp']
++cosmic-comp-config = { path = "../cosmic-comp/cosmic-comp-config" }
++
+ # [patch.'https://github.com/pop-os/cosmic-settings-daemon']
+ # cosmic-settings-config = { git = "https://github.com/pop-os/cosmic-settings-daemon//", branch = "input_nobuild" }
+ 
+diff --git a/cosmic-settings/src/pages/input/mod.rs b/cosmic-settings/src/pages/input/mod.rs
+index 10613dc..e81569e 100644
+--- a/cosmic-settings/src/pages/input/mod.rs
++++ b/cosmic-settings/src/pages/input/mod.rs
+@@ -21,6 +21,7 @@ pub enum Message {
+     DisableWhileTyping(bool, bool),
+     PrimaryButtonSelected(cosmic::widget::segmented_button::Entity, bool),
+     SetAcceleration(bool, bool),
++    SetKineticScroll(bool, bool),
+     SetMouseSpeed(f64, bool),
+     SetNaturalScroll(bool, bool),
+     SetSecondaryClickBehavior(Option<ClickMethod>, bool),
+@@ -121,6 +122,12 @@ impl Page {
+                 });
+             }
+ 
++            Message::SetKineticScroll(enabled, touchpad) => self.update_input(touchpad, |x| {
++                x.scroll_config
++                    .get_or_insert(ScrollConfig::default())
++                    .kinetic = Some(enabled);
++            }),
++
+             Message::SetNaturalScroll(enabled, touchpad) => self.update_input(touchpad, |x| {
+                 x.scroll_config
+                     .get_or_insert(ScrollConfig::default())
+diff --git a/cosmic-settings/src/pages/input/touchpad.rs b/cosmic-settings/src/pages/input/touchpad.rs
+index 29d167c..72b0350 100644
+--- a/cosmic-settings/src/pages/input/touchpad.rs
++++ b/cosmic-settings/src/pages/input/touchpad.rs
+@@ -193,6 +193,8 @@ fn click_behavior() -> Section<crate::pages::Message> {
+ fn scrolling() -> Section<crate::pages::Message> {
+     crate::slab!(descriptions {
+         edge = fl!("scrolling", "edge");
++        kinetic = fl!("scrolling", "kinetic");
++        kinetic_desc = fl!("scrolling", "kinetic-desc");
+         natural = fl!("scrolling", "natural");
+         natural_desc = fl!("scrolling", "natural-desc");
+         scroll_speed = fl!("scrolling", "speed");
+@@ -274,6 +276,18 @@ fn scrolling() -> Section<crate::pages::Message> {
+                             |enabled| Message::SetNaturalScroll(enabled, true),
+                         ),
+                 )
++                // Kinetic (smooth) scrolling toggle
++                .add(
++                    settings::item::builder(&descriptions[kinetic])
++                        .description(&descriptions[kinetic_desc])
++                        .toggler(
++                            page.input_touchpad
++                                .scroll_config
++                                .as_ref()
++                                .is_some_and(|conf| conf.kinetic.unwrap_or(false)),
++                            |enabled| Message::SetKineticScroll(enabled, true),
++                        ),
++                )
+                 .apply(Element::from)
+                 .map(crate::pages::Message::Input)
+         })
+diff --git a/i18n/en/cosmic_settings.ftl b/i18n/en/cosmic_settings.ftl
+index eb2babe..1f4d2db 100644
+--- a/i18n/en/cosmic_settings.ftl
++++ b/i18n/en/cosmic_settings.ftl
+@@ -689,6 +689,8 @@ scrolling = Scrolling
+     .speed = Scrolling speed
+     .natural = Natural scrolling
+     .natural-desc = Scroll the content, instead of the view
++    .kinetic = Smooth scrolling
++    .kinetic-desc = Continue scrolling with momentum after lifting your fingers
+ 
+ ## Input: Keyboard
+ 

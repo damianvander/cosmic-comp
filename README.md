@@ -2,7 +2,7 @@
 
 A **patch/overlay repo** for [COSMIC](https://github.com/pop-os) that adds
 compositor-side **kinetic (smooth) scrolling** with **per-app scroll-factor
-overrides**, plus a settings UI to configure it.
+overrides**, plus a settings-app UI toggle to enable it.
 
 This repo does **not** vendor the upstream source. It carries only:
 
@@ -17,9 +17,9 @@ The projects being patched are cloned on demand into gitignored working dirs.
 
 ```
 .
-├── kinetic-scrolling.patch          # cosmic-comp: kinetic scrolling engine
-├── kinetic-overrides.patch          # cosmic-comp: per-app scroll-factor overrides
-├── install-kinetic-cosmic-comp.sh   # end-user installer (fetches prebuilt release)
+├── cosmic-comp-kinetic.patch        # cosmic-comp: kinetic engine + per-app factors
+├── cosmic-settings-kinetic.patch    # cosmic-settings: smooth-scrolling UI toggle
+├── install-kinetic.sh               # end-user installer (fetches prebuilt release)
 ├── .github/workflows/               # patch + build + release automation
 ├── cosmic-comp/                     # (gitignored) working clone of pop-os/cosmic-comp
 └── cosmic-settings/                 # (gitignored) working clone of pop-os/cosmic-settings
@@ -35,18 +35,46 @@ git clone https://github.com/pop-os/cosmic-comp.git     cosmic-comp
 git clone https://github.com/pop-os/cosmic-settings.git cosmic-settings
 ```
 
-Apply the current patches into the cosmic-comp clone:
+Apply the current patches:
 
 ```bash
-git -C cosmic-comp apply ../kinetic-scrolling.patch
-git -C cosmic-comp apply ../kinetic-overrides.patch
+git -C cosmic-comp     apply ../cosmic-comp-kinetic.patch
+git -C cosmic-settings apply ../cosmic-settings-kinetic.patch
+```
+
+> **Note:** `cosmic-settings-kinetic.patch` redirects the `cosmic-comp-config`
+> dependency at `../cosmic-comp/cosmic-comp-config` (via a Cargo `[patch]`), so
+> the new `kinetic` / `scroll_factor_per_app` config fields are visible to the
+> UI. Building cosmic-settings therefore requires the **patched** cosmic-comp
+> clone to exist as a sibling directory.
+
+## Regenerating a patch after edits
+
+```bash
+git -C cosmic-comp     diff > cosmic-comp-kinetic.patch
+git -C cosmic-settings diff > cosmic-settings-kinetic.patch
 ```
 
 ## Install (end users)
 
+Prebuilt, patched binaries are published per upstream epoch as GitHub Releases
+tagged `patched-<component>-<epoch>`.
+
 ```bash
-./install-kinetic-cosmic-comp.sh
+./install-kinetic.sh                   # cosmic-comp, auto-detects your epoch
+./install-kinetic.sh cosmic-settings   # the settings app
+./install-kinetic.sh cosmic-comp epoch-1.2.0   # a specific epoch
 ```
 
-This downloads the latest patched `cosmic-comp` binary from Releases and
-installs it. Log out and back in (or restart `cosmic-comp.service`) to apply.
+Log out and back in (compositor) or relaunch Settings for changes to apply.
+Once installed, enable **Settings → Input Devices → Touchpad → Scrolling →
+Smooth scrolling**.
+
+## CI
+
+`.github/workflows/patch-and-build.yml` polls upstream every 6 hours (and runs
+on manual dispatch). For each component it resolves the latest `epoch-*` tag,
+skips it if already released, otherwise clones upstream at that tag, applies the
+patch, builds, and publishes a `patched-<component>-<epoch>` release. The
+cosmic-settings leg additionally lays out a patched cosmic-comp checkout so its
+`cosmic-comp-config` path patch resolves.

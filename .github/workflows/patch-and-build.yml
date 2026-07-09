@@ -1,220 +1,238 @@
-name: Patch & Build cosmic-comp
+name: Patch & Build
 
 on:
   # ── Poll upstream for new epoch tags every 6 hours ──────────────────
   schedule:
     - cron: '0 */6 * * *'
 
-  # ── Manual trigger with optional upstream ref override ──────────────
+  # ── Manual trigger ─────────────────────────────────────────────────
   workflow_dispatch:
     inputs:
+      component:
+        description: Which component to patch & build.
+        type: choice
+        options: [all, cosmic-comp, cosmic-settings]
+        default: all
       upstream_ref:
         description: >
-          Git hash or tag (e.g. 'epoch-1.2.0') from pop-os/cosmic-comp to
-          patch against. Leave empty to build the latest epoch tag.
+          Epoch tag (e.g. 'epoch-1.2.0') or raw commit to build against.
+          Leave empty to build the latest epoch tag.
         required: false
         default: ''
-
-env:
-  UPSTREAM_REPO: https://github.com/pop-os/cosmic-comp.git
-  PATCH_FILE: kinetic-scrolling.patch
+      force:
+        description: Rebuild even if a release for the tag already exists.
+        type: boolean
+        default: false
 
 jobs:
-  # ════════════════════════════════════════════════════════════════════
-  # Job 1: Detect new upstream epoch tags we haven't released yet
-  # ════════════════════════════════════════════════════════════════════
-  detect:
-    name: Detect new epoch releases
+  build:
+    name: ${{ matrix.component }}
+    # Skip legs not selected on manual dispatch; always run all on schedule.
+    if: >-
+      github.event_name != 'workflow_dispatch' ||
+      github.event.inputs.component == 'all' ||
+      github.event.inputs.component == matrix.component
     runs-on: ubuntu-latest
-    outputs:
-      tag: ${{ steps.resolve.outputs.tag }}
-      commit: ${{ steps.resolve.outputs.commit }}
-      should_build: ${{ steps.resolve.outputs.should_build }}
+    permissions:
+      contents: write   # needed to create releases
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - component: cosmic-comp
+            repo: https://github.com/pop-os/cosmic-comp.git
+            patch: cosmic-comp-kinetic.patch
+            binary: cosmic-comp
+            build_args: --release
+            # cosmic-comp-config's local patch path is not needed for the comp build.
+            needs_comp_config: false
+            deps: >-
+              libudev-dev libgbm-dev libxkbcommon-dev libegl1-mesa-dev
+              libwayland-dev libinput-dev libdbus-1-dev libsystemd-dev
+              libseat-dev libdisplay-info-dev
+          - component: cosmic-settings
+            repo: https://github.com/pop-os/cosmic-settings.git
+            patch: cosmic-settings-kinetic.patch
+            binary: cosmic-settings
+            build_args: --release -p cosmic-settings
+            # The settings patch redirects cosmic-comp-config at a sibling
+            # patched cosmic-comp checkout — CI must lay that out (see below).
+            needs_comp_config: true
+            deps: >-
+              lld cmake libclang-dev libdav1d-dev libexpat1-dev
+              libfontconfig-dev libfreetype-dev libpipewire-0.3-dev
+              libpulse-dev pkg-config libxkbcommon-dev libudev-dev
+              libinput-dev libwayland-dev
 
     steps:
+      # ── 1. Checkout this patch repo (holds the .patch files) ─────────
+      - name: Checkout patch repo
+        uses: actions/checkout@v4
+        with:
+          path: patchrepo
+
+      # ── 2. Resolve the upstream ref & decide whether to build ────────
       - name: Resolve upstream ref
         id: resolve
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ matrix.repo }}
+          COMPONENT: ${{ matrix.component }}
+          MANUAL_REF: ${{ github.event.inputs.upstream_ref }}
+          FORCE: ${{ github.event.inputs.force }}
         run: |
           set -euo pipefail
 
-          MANUAL_REF="${{ github.event.inputs.upstream_ref }}"
-
           if [ -n "$MANUAL_REF" ]; then
-            # ── Manual dispatch with explicit ref ──
-            # Check if it looks like an epoch tag
             if [[ "$MANUAL_REF" == epoch-* ]]; then
               TAG="$MANUAL_REF"
-              COMMIT=$(git ls-remote "$UPSTREAM_REPO" "refs/tags/$TAG" | cut -f1)
-              if [ -z "$COMMIT" ]; then
-                echo "::error::Tag $TAG not found in upstream"
-                exit 1
-              fi
+              COMMIT=$(git ls-remote "$REPO" "refs/tags/$TAG" | cut -f1)
+              [ -z "$COMMIT" ] && { echo "::error::Tag $TAG not found in $REPO"; exit 1; }
             else
-              # Treat as a raw commit hash
               TAG="manual-${MANUAL_REF:0:8}"
               COMMIT="$MANUAL_REF"
             fi
-            echo "tag=$TAG"       >> "$GITHUB_OUTPUT"
-            echo "commit=$COMMIT" >> "$GITHUB_OUTPUT"
-            echo "should_build=true" >> "$GITHUB_OUTPUT"
-            echo "### Manual build requested" >> "$GITHUB_STEP_SUMMARY"
-            echo "- **Ref:** \`$MANUAL_REF\`" >> "$GITHUB_STEP_SUMMARY"
-            echo "- **Tag:** \`$TAG\`" >> "$GITHUB_STEP_SUMMARY"
-            exit 0
+          else
+            LATEST=$(git ls-remote --tags --sort=-v:refname "$REPO" 'epoch-*' \
+                     | grep -v '\^{}' | head -n1)
+            TAG=$(echo "$LATEST" | sed 's|.*refs/tags/||')
+            COMMIT=$(echo "$LATEST" | cut -f1)
+            if [ -z "$TAG" ] || [ -z "$COMMIT" ]; then
+              echo "::warning::No epoch tags found in $REPO"
+              echo "should_build=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
           fi
 
-          # ── Scheduled run: find the latest upstream epoch tag ──
-          LATEST=$(git ls-remote --tags --sort=-v:refname "$UPSTREAM_REPO" 'epoch-*' \
-                   | head -n1)
-          TAG=$(echo "$LATEST" | sed 's|.*refs/tags/||')
-          COMMIT=$(echo "$LATEST" | cut -f1)
+          RELEASE_TAG="patched-${COMPONENT}-${TAG}"
 
-          if [ -z "$TAG" ] || [ -z "$COMMIT" ]; then
-            echo "::warning::No epoch tags found upstream"
-            echo "should_build=false" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
-          echo "Latest upstream epoch tag: $TAG ($COMMIT)"
-
-          # Check if we already have a release for this tag
-          RELEASE_TAG="patched-${TAG}"
-          if gh release view "$RELEASE_TAG" --repo "${{ github.repository }}" > /dev/null 2>&1; then
+          if [ "$FORCE" != "true" ] && \
+             gh release view "$RELEASE_TAG" --repo "${{ github.repository }}" >/dev/null 2>&1; then
             echo "Release $RELEASE_TAG already exists — skipping"
             echo "should_build=false" >> "$GITHUB_OUTPUT"
           else
-            echo "No release for $RELEASE_TAG — triggering build"
-            echo "tag=$TAG"            >> "$GITHUB_OUTPUT"
-            echo "commit=$COMMIT"      >> "$GITHUB_OUTPUT"
-            echo "should_build=true"   >> "$GITHUB_OUTPUT"
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
           fi
 
-          echo "### Detection Result" >> "$GITHUB_STEP_SUMMARY"
-          echo "- **Latest upstream tag:** \`$TAG\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "tag=$TAG"                 >> "$GITHUB_OUTPUT"
+          echo "commit=$COMMIT"           >> "$GITHUB_OUTPUT"
+          echo "release_tag=$RELEASE_TAG" >> "$GITHUB_OUTPUT"
 
-  # ════════════════════════════════════════════════════════════════════
-  # Job 2: Patch & build, then publish a GitHub Release
-  # ════════════════════════════════════════════════════════════════════
-  patch-and-build:
-    name: Patch & Release Build
-    needs: detect
-    if: needs.detect.outputs.should_build == 'true'
-    runs-on: ubuntu-latest
+          {
+            echo "### ${COMPONENT}"
+            echo "- **Upstream tag:** \`$TAG\`"
+            echo "- **Commit:** \`$COMMIT\`"
+            echo "- **Release tag:** \`$RELEASE_TAG\`"
+          } >> "$GITHUB_STEP_SUMMARY"
 
-    permissions:
-      contents: write   # needed to create releases
-
-    steps:
-      # ── 1. Checkout this fork (contains the patch file) ──────────────
-      - name: Checkout fork
-        uses: actions/checkout@v4
-
-      # ── 2. Fetch the upstream repo ───────────────────────────────────
-      - name: Fetch upstream
+      # ── 3. Clone the upstream component at the resolved commit ───────
+      - name: Checkout upstream ${{ matrix.component }}
+        if: steps.resolve.outputs.should_build == 'true'
         run: |
-          git remote add cosmic "$UPSTREAM_REPO" || true
-          git fetch cosmic --tags
+          set -euo pipefail
+          git clone "${{ matrix.repo }}" "${{ matrix.component }}"
+          git -C "${{ matrix.component }}" checkout ${{ steps.resolve.outputs.commit }}
+          git -C "${{ matrix.component }}" apply "$GITHUB_WORKSPACE/patchrepo/${{ matrix.patch }}"
+          echo "✅ Applied ${{ matrix.patch }} on ${{ steps.resolve.outputs.tag }}"
 
-      # ── 3. Create a clean branch from the upstream commit ────────────
-      - name: Create patched branch
+      # ── 3b. cosmic-settings only: lay out the sibling patched
+      #        cosmic-comp so its cosmic-comp-config path patch resolves ─
+      - name: Prepare patched cosmic-comp-config
+        if: steps.resolve.outputs.should_build == 'true' && matrix.needs_comp_config
         run: |
-          git checkout ${{ needs.detect.outputs.commit }}
-          git checkout -b patched-build
+          set -euo pipefail
+          git clone https://github.com/pop-os/cosmic-comp.git cosmic-comp
+          # Match the settings tag; fall back to master if that tag is absent.
+          if git -C cosmic-comp rev-parse -q --verify "${{ steps.resolve.outputs.tag }}^{commit}" >/dev/null; then
+            git -C cosmic-comp checkout "${{ steps.resolve.outputs.tag }}"
+          else
+            echo "::warning::cosmic-comp has no ${{ steps.resolve.outputs.tag }}; using master for cosmic-comp-config"
+          fi
+          git -C cosmic-comp apply "$GITHUB_WORKSPACE/patchrepo/cosmic-comp-kinetic.patch"
 
-      # ── 4. Apply the kinetic scrolling patch ─────────────────────────
-      - name: Apply patch
-        run: |
-          git show origin/${{ github.ref_name }}:${{ env.PATCH_FILE }} > /tmp/patch.diff
-          echo "::group::Patch stats"
-          git apply --stat /tmp/patch.diff
-          echo "::endgroup::"
-          git apply /tmp/patch.diff
-          echo "✅ Patch applied cleanly on top of ${{ needs.detect.outputs.tag }}"
-
-      # ── 5. Install system build dependencies ─────────────────────────
+      # ── 4. System build dependencies ────────────────────────────────
       - name: Install system dependencies
+        if: steps.resolve.outputs.should_build == 'true'
         run: |
           sudo apt-get update
-          sudo apt-get install -y \
-            libudev-dev libgbm-dev libxkbcommon-dev libegl1-mesa-dev \
-            libwayland-dev libinput-dev libdbus-1-dev libsystemd-dev \
-            libseat-dev libdisplay-info-dev
+          sudo apt-get install -y ${{ matrix.deps }}
 
-      # ── 6. Install Rust toolchain ────────────────────────────────────
+      # ── 5. Rust toolchain ───────────────────────────────────────────
       - name: Install Rust
+        if: steps.resolve.outputs.should_build == 'true'
         uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: "1.90"
+          toolchain: stable
 
-      # ── 7. Cargo cache ──────────────────────────────────────────────
+      # ── 6. Cargo cache ──────────────────────────────────────────────
       - name: Cargo cache
+        if: steps.resolve.outputs.should_build == 'true'
         uses: actions/cache@v4
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-release-${{ hashFiles('**/Cargo.toml', '**/Cargo.lock') }}
+            ${{ matrix.component }}/target
+          key: ${{ runner.os }}-${{ matrix.component }}-${{ steps.resolve.outputs.tag }}
           restore-keys: |
-            ${{ runner.os }}-cargo-release-
+            ${{ runner.os }}-${{ matrix.component }}-
 
-      # ── 8. Build production binary ───────────────────────────────────
+      # ── 7. Build ────────────────────────────────────────────────────
       - name: Build release binary
-        run: cargo build --release
+        if: steps.resolve.outputs.should_build == 'true'
+        working-directory: ${{ matrix.component }}
+        run: cargo build ${{ matrix.build_args }}
 
-      # ── 9. Prepare release assets ───────────────────────────────────
-      - name: Prepare release
-        id: meta
+      # ── 8. Package assets ───────────────────────────────────────────
+      - name: Package
+        id: pkg
+        if: steps.resolve.outputs.should_build == 'true'
+        working-directory: ${{ matrix.component }}
         run: |
-          TAG="${{ needs.detect.outputs.tag }}"
-          RELEASE_TAG="patched-${TAG}"
-          BINARY=target/release/cosmic-comp
-          VERSION=$($BINARY --version 2>/dev/null || echo "unknown")
+          set -euo pipefail
+          BIN="target/release/${{ matrix.binary }}"
+          VERSION=$("$BIN" --version 2>/dev/null || echo "unknown")
+          cp "$BIN" "${{ matrix.binary }}"
+          gzip -k "${{ matrix.binary }}"
+          sha256sum "${{ matrix.binary }}.gz" "${{ matrix.binary }}" > checksums-sha256.txt
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
-          # Compress the binary
-          cp "$BINARY" cosmic-comp
-          gzip -k cosmic-comp
-          sha256sum cosmic-comp.gz cosmic-comp > checksums-sha256.txt
-
-          echo "release_tag=$RELEASE_TAG" >> "$GITHUB_OUTPUT"
-          echo "version=$VERSION"         >> "$GITHUB_OUTPUT"
-
-          echo "### Build Summary" >> "$GITHUB_STEP_SUMMARY"
-          echo "- **Upstream tag:** \`$TAG\`" >> "$GITHUB_STEP_SUMMARY"
-          echo "- **Release tag:** \`$RELEASE_TAG\`" >> "$GITHUB_STEP_SUMMARY"
-          echo "- **Binary version:** \`$VERSION\`" >> "$GITHUB_STEP_SUMMARY"
-
-      # ── 10. Create GitHub Release ───────────────────────────────────
+      # ── 9. Publish GitHub Release ───────────────────────────────────
       - name: Create GitHub Release
+        if: steps.resolve.outputs.should_build == 'true'
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ steps.meta.outputs.release_tag }}
-          name: "cosmic-comp + kinetic scrolling (${{ needs.detect.outputs.tag }})"
+          tag_name: ${{ steps.resolve.outputs.release_tag }}
+          name: "${{ matrix.component }} + kinetic scrolling (${{ steps.resolve.outputs.tag }})"
           body: |
-            ## Patched cosmic-comp build
+            ## Patched ${{ matrix.component }}
 
-            This release applies the **kinetic (smooth) scrolling** patch on top of
-            upstream [`${{ needs.detect.outputs.tag }}`](https://github.com/pop-os/cosmic-comp/releases/tag/${{ needs.detect.outputs.tag }}).
+            Applies the kinetic (smooth) scrolling + per-app scroll-factor
+            override patch on top of upstream
+            [`${{ steps.resolve.outputs.tag }}`](https://github.com/pop-os/${{ matrix.component }}/releases/tag/${{ steps.resolve.outputs.tag }}).
 
-            **Upstream commit:** `${{ needs.detect.outputs.commit }}`
-            **Binary version:** `${{ steps.meta.outputs.version }}`
-            **Patch:** `${{ env.PATCH_FILE }}`
+            **Upstream commit:** `${{ steps.resolve.outputs.commit }}`
+            **Binary version:** `${{ steps.pkg.outputs.version }}`
+            **Patch:** `${{ matrix.patch }}`
 
             ### Install
             ```bash
-            gunzip cosmic-comp.gz
-            chmod +x cosmic-comp
-            sudo install -Dm0755 cosmic-comp /usr/bin/cosmic-comp
+            ./install-kinetic.sh ${{ matrix.component }}
+            ```
+            or manually:
+            ```bash
+            gunzip ${{ matrix.binary }}.gz
+            chmod +x ${{ matrix.binary }}
+            sudo install -Dm0755 ${{ matrix.binary }} /usr/bin/${{ matrix.binary }}
             ```
 
             > [!NOTE]
-            > You will need to log out and back in (or restart `cosmic-comp.service`)
-            > for the new binary to take effect.
+            > Log out and back in (or restart the relevant service) for the new
+            > binary to take effect.
           files: |
-            cosmic-comp.gz
-            cosmic-comp
-            checksums-sha256.txt
+            ${{ matrix.component }}/${{ matrix.binary }}.gz
+            ${{ matrix.component }}/${{ matrix.binary }}
+            ${{ matrix.component }}/checksums-sha256.txt
           draft: false
           prerelease: false

@@ -1,0 +1,713 @@
+diff --git a/README.md b/README.md
+new file mode 100644
+index 00000000..faa37ff7
+--- /dev/null
++++ b/README.md
+@@ -0,0 +1,99 @@
++# cosmic-comp — kinetic scroll branch
++
++This branch adds compositor-side kinetic ("fling") scrolling and per-app
++scroll-factor overrides to the COSMIC Wayland compositor.
++
++## Compile and install
++
++### 1. Install Rust (if you don't already have it)
++
++```sh
++curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
++. "$HOME/.cargo/env"
++```
++
++### 2. Install build dependencies (Debian/Ubuntu/Pop!\_OS)
++
++```sh
++sudo apt install -y libudev-dev libsystemd-dev libseat-dev \
++    libdisplay-info-dev libwayland-dev libxkbcommon-dev \
++    libinput-dev libpixman-1-dev libgbm-dev
++```
++
++### 3. Build
++
++```sh
++cargo build --release -p cosmic-comp
++```
++
++Takes ~5 min with LTO. Output: `target/release/cosmic-comp` (~33 MB).
++
++### 4. Back up the existing binary and install the new one
++
++```sh
++sudo cp /usr/bin/cosmic-comp /usr/bin/cosmic-comp.bak
++sudo install -Dm0755 target/release/cosmic-comp /usr/bin/cosmic-comp
++```
++
++Rollback at any time:
++
++```sh
++sudo cp /usr/bin/cosmic-comp.bak /usr/bin/cosmic-comp
++# or
++sudo apt install --reinstall cosmic-comp
++```
++
++### 5. Configure (see below), then log out and log back in
++
++The new binary loads on the next session start. There is no live reload.
++
++## Configuration
++
++Edit `~/.config/cosmic/com.system76.CosmicComp/v1/input_touchpad`. The new
++fields are `kinetic` and `scroll_factor_per_app` on `ScrollConfig`. Both
++are optional and default to off / empty.
++
++Example (copy of a working config):
++
++```ron
++(
++    state: Enabled,
++    click_method: Some(Clickfinger),
++    scroll_config: Some((
++        method: Some(TwoFinger),
++        natural_scroll: Some(true),
++        scroll_button: None,
++        scroll_factor: Some(1.0),
++        kinetic: Some(true),
++        scroll_factor_per_app: Some({
++            "firefox": 0.135,
++            "brave-browser": 0.15,
++            "jetbrains-rider": 0.24,
++        }),
++    )),
++    tap_config: Some((
++        enabled: true,
++        button_map: Some(LeftRightMiddle),
++        drag: true,
++        drag_lock: false,
++    )),
++)
++```
++
++- `kinetic: Some(true)` enables inertial fling on two-finger scroll.
++- `scroll_factor` is the device-level multiplier (1.0 = libinput default).
++- `scroll_factor_per_app` keys are `xdg_toplevel.app_id` (Wayland) or
++  `WM_CLASS` class (XWayland); values multiply the device factor for that
++  app.
++
++### Finding an app's identifier
++
++The compositor logs the resolved app_id on every axis event.
++
++After relog, scroll inside the app and:
++
++```sh
++journalctl --user -f | grep "scroll axis"
++```
++
++Use the `app_id=` string verbatim as the key in `scroll_factor_per_app`.
+diff --git a/cosmic-comp-config/src/input.rs b/cosmic-comp-config/src/input.rs
+index df6f34c2..43eccbcf 100644
+--- a/cosmic-comp-config/src/input.rs
++++ b/cosmic-comp-config/src/input.rs
+@@ -4,6 +4,7 @@
+ 
+ pub use input::{AccelProfile, ClickMethod, ScrollMethod, TapButtonMap};
+ use serde::{Deserialize, Serialize};
++use std::collections::HashMap;
+ 
+ // Note: For the following values, None is used to represent the system default
+ // Configuration for input devices
+@@ -47,6 +48,14 @@ pub struct ScrollConfig {
+     pub natural_scroll: Option<bool>,
+     pub scroll_button: Option<u32>,
+     pub scroll_factor: Option<f64>,
++    #[serde(skip_serializing_if = "Option::is_none", default)]
++    pub kinetic: Option<bool>,
++    /// Per-app multiplier on `scroll_factor`. Key is xdg_toplevel.app_id
++    /// (Wayland) or WM_CLASS class (XWayland). Value is a multiplier;
++    /// 1.0 is neutral, <1.0 attenuates, >1.0 amplifies. Used to normalise
++    /// scroll distance across apps that interpret wheel/value120 differently.
++    #[serde(skip_serializing_if = "Option::is_none", default)]
++    pub scroll_factor_per_app: Option<HashMap<String, f64>>,
+ }
+ 
+ #[derive(Copy, Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+diff --git a/src/config/input_config.rs b/src/config/input_config.rs
+index ae74da68..1e1ea05a 100644
+--- a/src/config/input_config.rs
++++ b/src/config/input_config.rs
+@@ -65,6 +65,8 @@ pub fn for_device(device: &InputDevice) -> InputConfig {
+                     None
+                 },
+                 scroll_factor: None,
++                kinetic: None,
++                scroll_factor_per_app: None,
+             })
+         } else {
+             None
+diff --git a/src/config/mod.rs b/src/config/mod.rs
+index 66cb2b83..b6b41905 100644
+--- a/src/config/mod.rs
++++ b/src/config/mod.rs
+@@ -622,6 +622,35 @@ impl Config {
+         .map_or(1.0, |x| x.0)
+     }
+ 
++    pub fn kinetic_scroll_enabled(&self, device: &InputDevice) -> bool {
++        let (device_config, default_config) = self.get_device_config(device);
++        input_config::get_config(device_config.as_ref(), default_config, |x| {
++            x.scroll_config.as_ref()?.kinetic
++        })
++        .is_some_and(|x| x.0)
++    }
++
++    /// Resolve the effective scroll factor for a device, combined with any
++    /// per-app multiplier configured for `app_id`. Missing entries default
++    /// to 1.0 (no per-app scaling).
++    pub fn scroll_factor_for_app(&self, device: &InputDevice, app_id: Option<&str>) -> f64 {
++        let device_factor = self.scroll_factor(device);
++        let Some(app_id) = app_id else {
++            return device_factor;
++        };
++        let (device_config, default_config) = self.get_device_config(device);
++        let app_factor = input_config::get_config(device_config.as_ref(), default_config, |x| {
++            x.scroll_config
++                .as_ref()?
++                .scroll_factor_per_app
++                .as_ref()?
++                .get(app_id)
++                .copied()
++        })
++        .map_or(1.0, |x| x.0);
++        device_factor * app_factor
++    }
++
+     pub fn map_to_output(&self, device: &InputDevice) -> Option<String> {
+         let (device_config, default_config) = self.get_device_config(device);
+         Some(
+diff --git a/src/input/kinetic.rs b/src/input/kinetic.rs
+new file mode 100644
+index 00000000..fbf3dec5
+--- /dev/null
++++ b/src/input/kinetic.rs
+@@ -0,0 +1,265 @@
++// SPDX-License-Identifier: GPL-3.0-only
++//
++// Compositor-side kinetic (inertial) scrolling for two-finger touchpad scroll.
++//
++// Buffered finger-source axis deltas feed a closed-form exponential fling on
++// lift; synthetic `wl_pointer.axis` events with `AxisSource::Continuous` are
++// emitted until velocity decays below `STOP_VELOCITY`. When kinetic is active
++// the same `Continuous` source is also used for live finger scroll (see the
++// PointerAxis arm in `mod.rs`), so the fling and the gesture before it look
++// like one uninterrupted stream to the client — no source transitions, no
++// `axis_stop` frames either way, since `Continuous` does not require them.
++
++use crate::state::State;
++use calloop::timer::{TimeoutAction, Timer};
++use smithay::{
++    backend::input::{Axis, AxisSource},
++    input::{Seat, pointer::AxisFrame},
++    utils::{Logical, Point},
++};
++use std::{cell::RefCell, collections::VecDeque, time::Duration};
++
++/// Samples within this window of the most recent push contribute to the
++/// fling velocity at lift; older samples are dropped by [`trim`]. Biases
++/// the velocity estimate toward what the finger was doing *just* before
++/// release rather than averaging across the whole gesture.
++const VELOCITY_WINDOW: Duration = Duration::from_millis(80);
++/// Minimum raw lift velocity (logical units/sec) required to start a fling.
++const MIN_FLING_VELOCITY: f64 = 50.0;
++/// Velocity (logical units/sec) at which exponential decay hands over to the
++/// smooth-stop tail.
++const STOP_VELOCITY: f64 = 15.0;
++/// Per-millisecond friction during the exponential decay phase.
++const FRICTION_PER_MS: f64 = 0.995;
++/// Cap on initial fling velocity so an extreme flick doesn't whip-scroll the
++/// entire page in one frame.
++const MAX_FLING_VELOCITY: f64 = 4000.0;
++/// Duration of the smooth-stop tail (cubic ease-out to zero) that follows
++/// exponential decay. Without it, the fling cuts off abruptly at
++/// `STOP_VELOCITY` which can feel like a snap on low-precision scroll
++/// consumers (terminals, XWayland clients).
++const TAIL_DURATION_MS: f64 = 80.0;
++/// Tick interval for the fling timer (~125 Hz).
++const TICK: Duration = Duration::from_millis(8);
++
++#[derive(Clone, Copy, Debug)]
++struct Sample {
++    delta: Point<f64, Logical>,
++    time: Duration,
++}
++
++#[derive(Default)]
++pub struct KineticScroller(RefCell<Inner>);
++
++#[derive(Default)]
++struct Inner {
++    samples: VecDeque<Sample>,
++    velocity: Point<f64, Logical>,
++    active: bool,
++    last_tick: Option<Duration>,
++    /// True once exponential decay has dropped below [`STOP_VELOCITY`] and
++    /// we've switched to the cubic-ease-out tail.
++    in_tail: bool,
++    tail_start: Option<Duration>,
++    tail_initial_velocity: Point<f64, Logical>,
++}
++
++impl Inner {
++    fn clear_fling(&mut self) {
++        self.active = false;
++        self.velocity = Point::default();
++        self.last_tick = None;
++        self.in_tail = false;
++        self.tail_start = None;
++        self.tail_initial_velocity = Point::default();
++    }
++}
++
++impl KineticScroller {
++    /// Buffer a finger delta. If a fling was running, cancel it.
++    fn push(&self, delta: Point<f64, Logical>, t: Duration) {
++        let mut inner = self.0.borrow_mut();
++        if inner.active {
++            inner.clear_fling();
++        }
++        inner.samples.push_back(Sample { delta, time: t });
++        Self::trim(&mut inner.samples, t);
++    }
++
++    /// Compute velocity from buffered samples and, if above
++    /// `MIN_FLING_VELOCITY`, start the fling. Returns the initial velocity
++    /// when a fling actually starts. The buffer is already trimmed to
++    /// `VELOCITY_WINDOW` by [`push`], so `first`/`last` are the velocity
++    /// window directly — no further filtering needed.
++    fn start_fling(&self) -> Option<Point<f64, Logical>> {
++        let mut inner = self.0.borrow_mut();
++        let (first, last) = inner.samples.front().zip(inner.samples.back())?;
++        let span = last.time.saturating_sub(first.time).as_secs_f64();
++        let total = inner
++            .samples
++            .iter()
++            .fold(Point::<f64, Logical>::default(), |acc, s| acc + s.delta);
++        inner.samples.clear();
++
++        if span <= 0.0 {
++            return None;
++        }
++        let raw = Point::<f64, Logical>::from((total.x / span, total.y / span));
++        if raw.x.abs() < MIN_FLING_VELOCITY && raw.y.abs() < MIN_FLING_VELOCITY {
++            return None;
++        }
++
++        let velocity = Point::<f64, Logical>::from((
++            raw.x.clamp(-MAX_FLING_VELOCITY, MAX_FLING_VELOCITY),
++            raw.y.clamp(-MAX_FLING_VELOCITY, MAX_FLING_VELOCITY),
++        ));
++        inner.clear_fling();
++        inner.velocity = velocity;
++        inner.active = true;
++        Some(velocity)
++    }
++
++    /// Advance the fling. Returns the delta to emit, or `None` once the
++    /// exponential-decay-then-tail sequence completes (also clears `active`).
++    fn tick(&self, now: Duration) -> Option<Point<f64, Logical>> {
++        let mut inner = self.0.borrow_mut();
++        if !inner.active {
++            return None;
++        }
++
++        let last = inner.last_tick.unwrap_or(now);
++        let dt_ms = now.saturating_sub(last).as_secs_f64() * 1000.0;
++        inner.last_tick = Some(now);
++
++        if inner.in_tail {
++            let start = inner
++                .tail_start
++                .expect("tail_start set when in_tail is true");
++            let elapsed_ms = now.saturating_sub(start).as_secs_f64() * 1000.0;
++            if elapsed_ms >= TAIL_DURATION_MS {
++                inner.clear_fling();
++                return None;
++            }
++            // Cubic ease-out position curve: velocity(t) = v0 * (1 - t/T)^2.
++            let t_norm = elapsed_ms / TAIL_DURATION_MS;
++            let v_factor = (1.0 - t_norm).powi(2);
++            let v = inner.tail_initial_velocity;
++            let cur_v = (v.x * v_factor, v.y * v_factor);
++            let dt_s = dt_ms / 1000.0;
++            inner.velocity = Point::from(cur_v);
++            return Some(Point::from((cur_v.0 * dt_s, cur_v.1 * dt_s)));
++        }
++
++        let delta = if dt_ms > 0.0 {
++            let factor = FRICTION_PER_MS.powf(dt_ms);
++            let scale = (factor - 1.0) / FRICTION_PER_MS.ln() / 1000.0;
++            let v = inner.velocity;
++            let out = Point::from((v.x * scale, v.y * scale));
++            inner.velocity = Point::from((v.x * factor, v.y * factor));
++            out
++        } else {
++            Point::default()
++        };
++
++        if inner.velocity.x.abs() < STOP_VELOCITY && inner.velocity.y.abs() < STOP_VELOCITY {
++            // Hand off from exponential decay to the smooth-stop tail.
++            inner.in_tail = true;
++            inner.tail_start = Some(now);
++            inner.tail_initial_velocity = inner.velocity;
++        }
++        Some(delta)
++    }
++
++    fn cancel_inner(&self) {
++        let mut inner = self.0.borrow_mut();
++        inner.clear_fling();
++        inner.samples.clear();
++    }
++
++    fn trim(samples: &mut VecDeque<Sample>, latest: Duration) {
++        while let Some(front) = samples.front() {
++            if latest <= front.time + VELOCITY_WINDOW {
++                break;
++            }
++            samples.pop_front();
++        }
++    }
++}
++
++// ---------------------------------------------------------------------------
++// Plumbing API used by `src/input/mod.rs` and `src/shell/focus/mod.rs`. Kept
++// as free functions so callers don't have to thread `KineticScroller`
++// references manually — they just have a seat.
++
++/// Cancel any running fling and discard buffered samples for this seat. No
++/// `axis_stop` frame is emitted; the kinetic stream uses `AxisSource::Continuous`
++/// which does not require one.
++pub fn cancel(seat: &Seat<State>) {
++    if let Some(scroller) = seat.user_data().get::<KineticScroller>() {
++        scroller.cancel_inner();
++    }
++}
++
++/// Buffer a finger delta. Cancels any running fling so a renewed gesture
++/// starts cleanly.
++pub fn push(seat: &Seat<State>, delta: Point<f64, Logical>, t: Duration) {
++    if let Some(scroller) = seat.user_data().get::<KineticScroller>() {
++        scroller.push(delta, t);
++    }
++}
++
++/// Try to start a fling from buffered samples. Returns true if one started —
++/// caller should suppress emitting any axis frame for this lift; the fling
++/// will emit decay frames itself.
++pub fn try_start_fling(state: &mut State, seat: &Seat<State>) -> bool {
++    let started = seat
++        .user_data()
++        .get::<KineticScroller>()
++        .and_then(|s| s.start_fling())
++        .is_some();
++    if started {
++        schedule_tick(state, seat);
++    }
++    started
++}
++
++fn schedule_tick(state: &mut State, seat: &Seat<State>) {
++    let seat = seat.clone();
++    let _ = state.common.event_loop_handle.insert_source(
++        Timer::from_duration(TICK),
++        move |_, _, state| {
++            tick_handler(state, &seat);
++            TimeoutAction::Drop
++        },
++    );
++}
++
++fn tick_handler(state: &mut State, seat: &Seat<State>) {
++    let now_time = state.common.clock.now();
++    let time_msec = now_time.as_millis();
++    let now: Duration = now_time.into();
++
++    let result = seat
++        .user_data()
++        .get::<KineticScroller>()
++        .and_then(|s| s.tick(now));
++
++    let Some(delta) = result else {
++        // Fling ended (decayed below STOP_VELOCITY) or was cancelled out from
++        // under the timer. No `axis_stop` emission — Continuous source does
++        // not require it.
++        return;
++    };
++
++    let mut frame = AxisFrame::new(time_msec).source(AxisSource::Continuous);
++    if delta.x != 0.0 {
++        frame = frame.value(Axis::Horizontal, delta.x);
++    }
++    if delta.y != 0.0 {
++        frame = frame.value(Axis::Vertical, delta.y);
++    }
++    let ptr = seat.get_pointer().unwrap();
++    ptr.axis(state, frame);
++    ptr.frame(state);
++    schedule_tick(state, seat);
++}
+diff --git a/src/input/mod.rs b/src/input/mod.rs
+index 2a62947c..373e7d2b 100644
+--- a/src/input/mod.rs
++++ b/src/input/mod.rs
+@@ -14,7 +14,7 @@ use crate::{
+         LastModifierChange, SeatExt, Trigger,
+         focus::{
+             Stage, render_input_order,
+-            target::{KeyboardFocusTarget, PointerFocusTarget},
++            target::{KeyboardFocusTarget, PointerFocusTarget, PointerFocusToplevel},
+         },
+         grabs::{ReleaseMode, ResizeEdge},
+         layout::{
+@@ -59,7 +59,7 @@ use smithay::{
+     reexports::{
+         input::Device as InputDevice, wayland_server::protocol::wl_shm::Format as ShmFormat,
+     },
+-    utils::{Point, Rectangle, SERIAL_COUNTER, Serial},
++    utils::{Logical, Point, Rectangle, SERIAL_COUNTER, Serial},
+     wayland::{
+         image_copy_capture::{BufferConstraints, CursorSessionRef},
+         keyboard_shortcuts_inhibit::KeyboardShortcutsInhibitorSeat,
+@@ -82,6 +82,7 @@ use std::{
+ 
+ pub mod actions;
+ pub mod gestures;
++pub mod kinetic;
+ 
+ /// Used for debouncing focus updates due to pointer motion, if after the focus change is
+ /// triggered the event will cancel if the pointer moves to the original target
+@@ -214,6 +215,10 @@ impl State {
+                     let state = event.state();
+                     trace!(?keycode, ?state, "key");
+ 
++                    if state == KeyState::Pressed {
++                        kinetic::cancel(&seat);
++                    }
++
+                     let serial = SERIAL_COUNTER.next_serial();
+                     let time = Event::time_msec(&event);
+                     let keyboard = seat.get_keyboard().unwrap();
+@@ -370,6 +375,15 @@ impl State {
+                         .map(|(target, pos)| (target, pos.as_logical()));
+ 
+                     std::mem::drop(shell);
++
++                    // Cancel any kinetic fling when the cursor crosses a
++                    // surface boundary — kinetic scroll routes to the pointer
++                    // focus, so without this the fling would silently keep
++                    // scrolling whichever window the cursor moved onto.
++                    if under.as_ref().map(|(t, _)| t) != new_under.as_ref().map(|(t, _)| t) {
++                        kinetic::cancel(&seat);
++                    }
++
+                     ptr.relative_motion(
+                         self,
+                         under.clone(),
+@@ -705,6 +719,7 @@ impl State {
+ 
+                 let mut pass_event = !seat.supressed_buttons().remove(button);
+                 if event.state() == ButtonState::Pressed {
++                    kinetic::cancel(&seat);
+                     // change the keyboard focus unless the pointer is grabbed
+                     // We test for any matching surface type here but always use the root
+                     // (in case of a window the toplevel) surface for the focus.
+@@ -882,13 +897,6 @@ impl State {
+                 }
+             }
+             InputEvent::PointerAxis { event, .. } => {
+-                let scroll_factor =
+-                    if let Some(device) = <dyn Any>::downcast_ref::<InputDevice>(&event.device()) {
+-                        self.common.config.scroll_factor(device)
+-                    } else {
+-                        1.0
+-                    };
+-
+                 let maybe_seat = self
+                     .common
+                     .shell
+@@ -896,6 +904,25 @@ impl State {
+                     .seats
+                     .for_device(&event.device())
+                     .cloned();
++                let app_id = maybe_seat.as_ref().and_then(focused_app_id);
++                let (scroll_factor, kinetic_enabled) =
++                    if let Some(device) = <dyn Any>::downcast_ref::<InputDevice>(&event.device()) {
++                        (
++                            self.common
++                                .config
++                                .scroll_factor_for_app(device, app_id.as_deref()),
++                            self.common.config.kinetic_scroll_enabled(device),
++                        )
++                    } else {
++                        (1.0, false)
++                    };
++                tracing::error!(
++                    target: "cosmic_comp::input::scroll",
++                    "scroll axis: app_id={:?} scroll_factor={:.3}",
++                    app_id.as_deref().unwrap_or("(none)"),
++                    scroll_factor,
++                );
++
+                 if let Some(seat) = maybe_seat {
+                     self.common.idle_notifier_state.notify_activity(&seat);
+ 
+@@ -907,6 +934,7 @@ impl State {
+                             .accessibility_zoom
+                             .enable_mouse_zoom_shortcuts
+                     {
++                        kinetic::cancel(&seat);
+                         seat.modifiers_shortcut_queue().clear();
+                         if let Some(mut percentage) = event
+                             .amount_v120(Axis::Vertical)
+@@ -922,7 +950,46 @@ impl State {
+                             self.update_zoom(&seat, change, event.source() == AxisSource::Wheel);
+                         }
+                     } else {
+-                        let mut frame = AxisFrame::new(event.time_msec()).source(event.source());
++                        // Kinetic-scroll hook. When `kinetic_enabled` and the
++                        // event is a Finger-source touchpad scroll, we feed
++                        // samples to the scroller and (on lift) try to start a
++                        // fling. The live frame below is re-emitted with
++                        // `AxisSource::Continuous` so the fling's source
++                        // matches and clients don't see any source transitions
++                        // or `axis_stop` frames mid-gesture.
++                        let mut suppress_frame = false;
++                        if event.source() != AxisSource::Finger {
++                            kinetic::cancel(&seat);
++                        } else if kinetic_enabled {
++                            let t = Duration::from_millis(event.time_msec() as u64);
++                            let dx_raw = event.amount(Axis::Horizontal).unwrap_or(0.0);
++                            let dy_raw = event.amount(Axis::Vertical).unwrap_or(0.0);
++                            if dx_raw == 0.0 && dy_raw == 0.0 {
++                                // Finger lift — no frame to emit either way;
++                                // a fling, if it starts, takes over from here.
++                                suppress_frame = true;
++                                if kinetic::try_start_fling(self, &seat) {
++                                    return;
++                                }
++                            } else {
++                                let delta = Point::<f64, Logical>::from((
++                                    dx_raw * scroll_factor,
++                                    dy_raw * scroll_factor,
++                                ));
++                                kinetic::push(&seat, delta, t);
++                            }
++                        }
++                        if suppress_frame {
++                            return;
++                        }
++
++                        let frame_source =
++                            if kinetic_enabled && event.source() == AxisSource::Finger {
++                                AxisSource::Continuous
++                            } else {
++                                event.source()
++                            };
++                        let mut frame = AxisFrame::new(event.time_msec()).source(frame_source);
+                         if let Some(horizontal_amount) = event.amount(Axis::Horizontal) {
+                             if horizontal_amount != 0.0 {
+                                 frame = frame
+@@ -933,7 +1000,7 @@ impl State {
+                                         (discrete * scroll_factor).round() as i32,
+                                     );
+                                 }
+-                            } else if event.source() == AxisSource::Finger {
++                            } else if event.source() == AxisSource::Finger && !kinetic_enabled {
+                                 frame = frame.stop(Axis::Horizontal);
+                             }
+                         }
+@@ -947,7 +1014,7 @@ impl State {
+                                         (discrete * scroll_factor).round() as i32,
+                                     );
+                                 }
+-                            } else if event.source() == AxisSource::Finger {
++                            } else if event.source() == AxisSource::Finger && !kinetic_enabled {
+                                 frame = frame.stop(Axis::Vertical);
+                             }
+                         }
+@@ -1206,6 +1273,12 @@ impl State {
+                     .cloned();
+                 if let Some(seat) = maybe_seat {
+                     self.common.idle_notifier_state.notify_activity(&seat);
++                    if event.fingers() == 2 {
++                        // 2 fingers landing on the touchpad — the user is about
++                        // to scroll; stop any in-flight fling immediately so it
++                        // doesn't fight the new gesture.
++                        kinetic::cancel(&seat);
++                    }
+                     let serial = SERIAL_COUNTER.next_serial();
+                     let pointer = seat.get_pointer().unwrap();
+                     pointer.gesture_hold_begin(
+@@ -2304,6 +2377,25 @@ impl State {
+     }
+ }
+ 
++/// Resolve the app identifier of the surface under the seat's pointer.
++/// Returns `None` for non-window focuses (layer surfaces, lock screen,
++/// popups without a parent toplevel) or when the app_id/WM_CLASS is unset.
++/// Used to look up per-app scroll multipliers.
++fn focused_app_id(seat: &Seat<State>) -> Option<String> {
++    let focus = seat.get_pointer()?.current_focus()?;
++    let app_id = match focus {
++        PointerFocusTarget::WlSurface {
++            toplevel: Some(PointerFocusToplevel::Surface(s)),
++            ..
++        } => s.app_id(),
++        PointerFocusTarget::X11Surface {
++            toplevel: Some(s), ..
++        } => s.app_id(),
++        _ => return None,
++    };
++    (!app_id.is_empty()).then_some(app_id)
++}
++
+ fn cursor_sessions_for_output<'a>(
+     shell: &'a Shell,
+     output: &'a Output,
+diff --git a/src/shell/focus/mod.rs b/src/shell/focus/mod.rs
+index 58301072..11a65d59 100644
+--- a/src/shell/focus/mod.rs
++++ b/src/shell/focus/mod.rs
+@@ -345,6 +345,13 @@ fn update_focus_state(
+     serial: Option<Serial>,
+     should_update_cursor: bool,
+ ) {
++    // Cancel any in-flight kinetic fling on focus change so it doesn't keep
++    // scrolling the previously-focused surface.
++    let prev_focus = seat.get_keyboard().and_then(|k| k.current_focus());
++    if prev_focus.as_ref() != target {
++        crate::input::kinetic::cancel(seat);
++    }
++
+     // update keyboard focus
+     if let Some(keyboard) = seat.get_keyboard() {
+         if should_update_cursor
+diff --git a/src/shell/seats.rs b/src/shell/seats.rs
+index a4f14364..70d7648e 100644
+--- a/src/shell/seats.rs
++++ b/src/shell/seats.rs
+@@ -5,7 +5,7 @@ use std::{any::Any, cell::RefCell, collections::HashMap, sync::Mutex};
+ use crate::{
+     backend::render::cursor::CursorState,
+     config::{Config, xkb_config_to_wl},
+-    input::{ModifiersShortcutQueue, SupressedButtons, SupressedKeys},
++    input::{ModifiersShortcutQueue, SupressedButtons, SupressedKeys, kinetic::KineticScroller},
+     state::State,
+ };
+ use smithay::{
+@@ -194,6 +194,7 @@ pub fn create_seat(
+     userdata.insert_if_missing(Devices::default);
+     userdata.insert_if_missing(SupressedKeys::default);
+     userdata.insert_if_missing(SupressedButtons::default);
++    userdata.insert_if_missing(KineticScroller::default);
+     userdata.insert_if_missing(ModifiersShortcutQueue::default);
+     userdata.insert_if_missing(LastModifierChange::default);
+     userdata.insert_if_missing_threadsafe(SeatMoveGrabState::default);

@@ -1,0 +1,13 @@
+# Working clones of the upstream projects being patched.
+# These are cloned on demand (see README) and are never tracked here.
+/cosmic-comp/
+/cosmic-settings/
+
+# Build / editor junk
+/target
+**/*.log
+.cargo
+.vscode
+/result
+vendor
+vendor.tar

@@ -67,8 +67,12 @@ tagged `patched-<component>-<epoch>`.
 ```
 
 Log out and back in (compositor) or relaunch Settings for changes to apply.
-Once installed, enable **Settings → Input Devices → Touchpad → Scrolling →
-Smooth scrolling**.
+Once installed:
+
+- Enable **Settings → Input Devices → Touchpad → Scrolling → Smooth scrolling**.
+- Tune per-app scroll speed under **Settings → Input Devices → Touchpad →
+  Per-app scroll speed** — add an app's Wayland app ID (or X11 WM_CLASS) and a
+  multiplier (1.0 = unchanged, <1.0 slower, >1.0 faster).
 
 ## CI
 

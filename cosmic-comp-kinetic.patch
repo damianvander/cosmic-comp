@@ -1,5 +1,5 @@
 diff --git a/cosmic-comp-config/src/input.rs b/cosmic-comp-config/src/input.rs
-index df6f34c2..43eccbcf 100644
+index df6f34c..43eccbc 100644
 --- a/cosmic-comp-config/src/input.rs
 +++ b/cosmic-comp-config/src/input.rs
 @@ -4,6 +4,7 @@
@@ -26,7 +26,7 @@ index df6f34c2..43eccbcf 100644
  
  #[derive(Copy, Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 diff --git a/src/config/input_config.rs b/src/config/input_config.rs
-index ae74da68..1e1ea05a 100644
+index ae74da6..1e1ea05 100644
 --- a/src/config/input_config.rs
 +++ b/src/config/input_config.rs
 @@ -65,6 +65,8 @@ pub fn for_device(device: &InputDevice) -> InputConfig {
@@ -39,7 +39,7 @@ index ae74da68..1e1ea05a 100644
          } else {
              None
 diff --git a/src/config/mod.rs b/src/config/mod.rs
-index 1d9b9c92..6217d362 100644
+index 1d9b9c9..6217d36 100644
 --- a/src/config/mod.rs
 +++ b/src/config/mod.rs
 @@ -622,6 +622,35 @@ impl Config {
@@ -80,10 +80,10 @@ index 1d9b9c92..6217d362 100644
          Some(
 diff --git a/src/input/kinetic.rs b/src/input/kinetic.rs
 new file mode 100644
-index 00000000..fbf3dec5
+index 0000000..a5717e6
 --- /dev/null
 +++ b/src/input/kinetic.rs
-@@ -0,0 +1,265 @@
+@@ -0,0 +1,307 @@
 +// SPDX-License-Identifier: GPL-3.0-only
 +//
 +// Compositor-side kinetic (inertial) scrolling for two-finger touchpad scroll.
@@ -161,15 +161,30 @@ index 00000000..fbf3dec5
 +    }
 +}
 +
++/// Outcome of a single fling [`KineticScroller::tick`].
++enum Tick {
++    /// Emit this delta and keep ticking.
++    Frame(Point<f64, Logical>),
++    /// The fling decayed to a stop this tick — emit a terminating
++    /// `axis_stop` and stop ticking.
++    Done,
++    /// No fling is running (it was cancelled out from under the timer) —
++    /// do nothing.
++    Idle,
++}
++
 +impl KineticScroller {
-+    /// Buffer a finger delta. If a fling was running, cancel it.
-+    fn push(&self, delta: Point<f64, Logical>, t: Duration) {
++    /// Buffer a finger delta. If a fling was running, cancel it and return
++    /// `true` so the caller can terminate that fling's scroll sequence.
++    fn push(&self, delta: Point<f64, Logical>, t: Duration) -> bool {
 +        let mut inner = self.0.borrow_mut();
++        let was_active = inner.active;
 +        if inner.active {
 +            inner.clear_fling();
 +        }
 +        inner.samples.push_back(Sample { delta, time: t });
 +        Self::trim(&mut inner.samples, t);
++        was_active
 +    }
 +
 +    /// Compute velocity from buffered samples and, if above
@@ -205,12 +220,12 @@ index 00000000..fbf3dec5
 +        Some(velocity)
 +    }
 +
-+    /// Advance the fling. Returns the delta to emit, or `None` once the
-+    /// exponential-decay-then-tail sequence completes (also clears `active`).
-+    fn tick(&self, now: Duration) -> Option<Point<f64, Logical>> {
++    /// Advance the fling. Returns the delta to emit, or a terminal state once
++    /// the exponential-decay-then-tail sequence completes / is cancelled.
++    fn tick(&self, now: Duration) -> Tick {
 +        let mut inner = self.0.borrow_mut();
 +        if !inner.active {
-+            return None;
++            return Tick::Idle;
 +        }
 +
 +        let last = inner.last_tick.unwrap_or(now);
@@ -224,7 +239,7 @@ index 00000000..fbf3dec5
 +            let elapsed_ms = now.saturating_sub(start).as_secs_f64() * 1000.0;
 +            if elapsed_ms >= TAIL_DURATION_MS {
 +                inner.clear_fling();
-+                return None;
++                return Tick::Done;
 +            }
 +            // Cubic ease-out position curve: velocity(t) = v0 * (1 - t/T)^2.
 +            let t_norm = elapsed_ms / TAIL_DURATION_MS;
@@ -233,7 +248,7 @@ index 00000000..fbf3dec5
 +            let cur_v = (v.x * v_factor, v.y * v_factor);
 +            let dt_s = dt_ms / 1000.0;
 +            inner.velocity = Point::from(cur_v);
-+            return Some(Point::from((cur_v.0 * dt_s, cur_v.1 * dt_s)));
++            return Tick::Frame(Point::from((cur_v.0 * dt_s, cur_v.1 * dt_s)));
 +        }
 +
 +        let delta = if dt_ms > 0.0 {
@@ -253,7 +268,7 @@ index 00000000..fbf3dec5
 +            inner.tail_start = Some(now);
 +            inner.tail_initial_velocity = inner.velocity;
 +        }
-+        Some(delta)
++        Tick::Frame(delta)
 +    }
 +
 +    fn cancel_inner(&self) {
@@ -287,11 +302,31 @@ index 00000000..fbf3dec5
 +}
 +
 +/// Buffer a finger delta. Cancels any running fling so a renewed gesture
-+/// starts cleanly.
-+pub fn push(seat: &Seat<State>, delta: Point<f64, Logical>, t: Duration) {
-+    if let Some(scroller) = seat.user_data().get::<KineticScroller>() {
-+        scroller.push(delta, t);
-+    }
++/// starts cleanly. Returns `true` if a fling was cancelled — the caller
++/// should then [`emit_stop`] to terminate that fling's scroll sequence so
++/// clients don't merge it with the new gesture.
++#[must_use]
++pub fn push(seat: &Seat<State>, delta: Point<f64, Logical>, t: Duration) -> bool {
++    seat.user_data()
++        .get::<KineticScroller>()
++        .map(|scroller| scroller.push(delta, t))
++        .unwrap_or(false)
++}
++
++/// Emit a `Continuous` `axis_stop` on both axes to delimit the end of a
++/// kinetic scroll sequence. Clients (Chromium/GTK) use this to end the scroll
++/// and reset scroll-axis locking; without it a series of scrolls looks like
++/// one unbroken sequence and stays locked to the first axis.
++pub fn emit_stop(state: &mut State, seat: &Seat<State>, time_msec: u32) {
++    let Some(ptr) = seat.get_pointer() else {
++        return;
++    };
++    let frame = AxisFrame::new(time_msec)
++        .source(AxisSource::Continuous)
++        .stop(Axis::Horizontal)
++        .stop(Axis::Vertical);
++    ptr.axis(state, frame);
++    ptr.frame(state);
 +}
 +
 +/// Try to start a fling from buffered samples. Returns true if one started —
@@ -328,13 +363,20 @@ index 00000000..fbf3dec5
 +    let result = seat
 +        .user_data()
 +        .get::<KineticScroller>()
-+        .and_then(|s| s.tick(now));
++        .map_or(Tick::Idle, |s| s.tick(now));
 +
-+    let Some(delta) = result else {
-+        // Fling ended (decayed below STOP_VELOCITY) or was cancelled out from
-+        // under the timer. No `axis_stop` emission — Continuous source does
-+        // not require it.
-+        return;
++    let delta = match result {
++        Tick::Frame(delta) => delta,
++        // Fling decayed to a stop: terminate the Continuous scroll sequence so
++        // the client resets scroll-axis locking. Do not reschedule.
++        Tick::Done => {
++            emit_stop(state, seat, time_msec);
++            return;
++        }
++        // Fling was cancelled out from under the timer (a new gesture, key,
++        // button, focus change, …). Whoever cancelled it terminates the
++        // sequence if needed; just stop ticking.
++        Tick::Idle => return,
 +    };
 +
 +    let mut frame = AxisFrame::new(time_msec).source(AxisSource::Continuous);
@@ -350,7 +392,7 @@ index 00000000..fbf3dec5
 +    schedule_tick(state, seat);
 +}
 diff --git a/src/input/mod.rs b/src/input/mod.rs
-index da3014ae..0fb3bf28 100644
+index 1114d50..e5356c8 100644
 --- a/src/input/mod.rs
 +++ b/src/input/mod.rs
 @@ -14,7 +14,7 @@ use crate::{
@@ -362,7 +404,7 @@ index da3014ae..0fb3bf28 100644
          },
          grabs::{ReleaseMode, ResizeEdge},
          layout::{
-@@ -88,6 +88,7 @@ use std::{
+@@ -89,6 +89,7 @@ use std::{
  
  pub mod actions;
  pub mod gestures;
@@ -370,7 +412,7 @@ index da3014ae..0fb3bf28 100644
  
  /// Used for debouncing focus updates due to pointer motion, if after the focus change is
  /// triggered the event will cancel if the pointer moves to the original target
-@@ -220,6 +221,10 @@ impl State {
+@@ -221,6 +222,10 @@ impl State {
                      let state = event.state();
                      trace!(?keycode, ?state, "key");
  
@@ -381,7 +423,7 @@ index da3014ae..0fb3bf28 100644
                      let serial = SERIAL_COUNTER.next_serial();
                      let time = Event::time_msec(&event);
                      let keyboard = seat.get_keyboard().unwrap();
-@@ -356,6 +361,9 @@ impl State {
+@@ -357,6 +362,9 @@ impl State {
                      }
  
                      std::mem::drop(shell);
@@ -391,7 +433,7 @@ index da3014ae..0fb3bf28 100644
                      ptr.relative_motion(
                          self,
                          under.clone(),
-@@ -578,6 +586,14 @@ impl State {
+@@ -579,6 +587,14 @@ impl State {
                      };
  
                      drop(shell);
@@ -406,7 +448,7 @@ index da3014ae..0fb3bf28 100644
                      if pointer_confined && new_under.is_none() {
                          ptr.frame(self);
                          return;
-@@ -774,6 +790,7 @@ impl State {
+@@ -775,6 +791,7 @@ impl State {
  
                  let mut pass_event = !seat.supressed_buttons().remove(button);
                  if event.state() == ButtonState::Pressed {
@@ -414,7 +456,7 @@ index da3014ae..0fb3bf28 100644
                      // change the keyboard focus unless the pointer is grabbed
                      // We test for any matching surface type here but always use the root
                      // (in case of a window the toplevel) surface for the focus.
-@@ -951,13 +968,6 @@ impl State {
+@@ -952,13 +969,6 @@ impl State {
                  }
              }
              InputEvent::PointerAxis { event, .. } => {
@@ -428,7 +470,7 @@ index da3014ae..0fb3bf28 100644
                  let maybe_seat = self
                      .common
                      .shell
-@@ -965,6 +975,25 @@ impl State {
+@@ -966,6 +976,25 @@ impl State {
                      .seats
                      .for_device(&event.device())
                      .cloned();
@@ -454,7 +496,7 @@ index da3014ae..0fb3bf28 100644
                  if let Some(seat) = maybe_seat {
                      self.common.idle_notifier_state.notify_activity(&seat);
                      notify_cursor_activity(self, &seat);
-@@ -977,6 +1006,7 @@ impl State {
+@@ -978,6 +1007,7 @@ impl State {
                              .accessibility_zoom
                              .enable_mouse_zoom_shortcuts
                      {
@@ -462,7 +504,7 @@ index da3014ae..0fb3bf28 100644
                          seat.modifiers_shortcut_queue().clear();
                          if let Some(mut percentage) = event
                              .amount_v120(Axis::Vertical)
-@@ -998,7 +1028,46 @@ impl State {
+@@ -999,7 +1029,50 @@ impl State {
                              self.update_zoom(&seat, change, event.source() == AxisSource::Wheel);
                          }
                      } else {
@@ -474,7 +516,6 @@ index da3014ae..0fb3bf28 100644
 +                        // `AxisSource::Continuous` so the fling's source
 +                        // matches and clients don't see any source transitions
 +                        // or `axis_stop` frames mid-gesture.
-+                        let mut suppress_frame = false;
 +                        if event.source() != AxisSource::Finger {
 +                            kinetic::cancel(&seat);
 +                        } else if kinetic_enabled {
@@ -482,22 +523,27 @@ index da3014ae..0fb3bf28 100644
 +                            let dx_raw = event.amount(Axis::Horizontal).unwrap_or(0.0);
 +                            let dy_raw = event.amount(Axis::Vertical).unwrap_or(0.0);
 +                            if dx_raw == 0.0 && dy_raw == 0.0 {
-+                                // Finger lift — no frame to emit either way;
-+                                // a fling, if it starts, takes over from here.
-+                                suppress_frame = true;
-+                                if kinetic::try_start_fling(self, &seat) {
-+                                    return;
++                                // Finger lift. Start a fling if there's enough
++                                // velocity — it plays out as its own Continuous
++                                // sequence and emits its own `axis_stop` when it
++                                // ends. Otherwise end the sequence now so the
++                                // client resets scroll-axis locking.
++                                if !kinetic::try_start_fling(self, &seat) {
++                                    kinetic::emit_stop(self, &seat, event.time_msec());
 +                                }
-+                            } else {
-+                                let delta = Point::<f64, Logical>::from((
-+                                    dx_raw * scroll_factor,
-+                                    dy_raw * scroll_factor,
-+                                ));
-+                                kinetic::push(&seat, delta, t);
++                                return;
 +                            }
-+                        }
-+                        if suppress_frame {
-+                            return;
++                            // Live finger scroll: buffer it for the fling. If
++                            // this interrupts a running fling, terminate that
++                            // fling's sequence first so the client doesn't merge
++                            // the two and stay locked to the old axis.
++                            let delta = Point::<f64, Logical>::from((
++                                dx_raw * scroll_factor,
++                                dy_raw * scroll_factor,
++                            ));
++                            if kinetic::push(&seat, delta, t) {
++                                kinetic::emit_stop(self, &seat, event.time_msec());
++                            }
 +                        }
 +
 +                        let frame_source =
@@ -510,7 +556,7 @@ index da3014ae..0fb3bf28 100644
                          if let Some(horizontal_amount) = event.amount(Axis::Horizontal) {
                              if horizontal_amount != 0.0 {
                                  frame = frame
-@@ -1009,7 +1078,7 @@ impl State {
+@@ -1010,7 +1083,7 @@ impl State {
                                          (discrete * scroll_factor).round() as i32,
                                      );
                                  }
@@ -519,7 +565,7 @@ index da3014ae..0fb3bf28 100644
                                  frame = frame.stop(Axis::Horizontal);
                              }
                          }
-@@ -1023,7 +1092,7 @@ impl State {
+@@ -1024,7 +1097,7 @@ impl State {
                                          (discrete * scroll_factor).round() as i32,
                                      );
                                  }
@@ -528,7 +574,7 @@ index da3014ae..0fb3bf28 100644
                                  frame = frame.stop(Axis::Vertical);
                              }
                          }
-@@ -1282,6 +1351,12 @@ impl State {
+@@ -1283,6 +1356,12 @@ impl State {
                      .cloned();
                  if let Some(seat) = maybe_seat {
                      self.common.idle_notifier_state.notify_activity(&seat);
@@ -541,7 +587,7 @@ index da3014ae..0fb3bf28 100644
                      let serial = SERIAL_COUNTER.next_serial();
                      let pointer = seat.get_pointer().unwrap();
                      pointer.gesture_hold_begin(
-@@ -2479,6 +2554,25 @@ impl State {
+@@ -2486,6 +2565,25 @@ impl State {
      }
  }
  
@@ -568,7 +614,7 @@ index da3014ae..0fb3bf28 100644
  fn cursor_sessions_for_output<'a>(
      shell: &'a Shell,
 diff --git a/src/shell/focus/mod.rs b/src/shell/focus/mod.rs
-index 9374230a..5deecaaf 100644
+index 9374230..5deecaa 100644
 --- a/src/shell/focus/mod.rs
 +++ b/src/shell/focus/mod.rs
 @@ -342,6 +342,13 @@ fn update_focus_state(
@@ -586,7 +632,7 @@ index 9374230a..5deecaaf 100644
      if let Some(keyboard) = seat.get_keyboard() {
          // remove constraint when target changed
 diff --git a/src/shell/seats.rs b/src/shell/seats.rs
-index 5273e97f..566c9953 100644
+index 5273e97..566c995 100644
 --- a/src/shell/seats.rs
 +++ b/src/shell/seats.rs
 @@ -5,7 +5,7 @@ use std::{any::Any, cell::RefCell, collections::HashMap, sync::Mutex};

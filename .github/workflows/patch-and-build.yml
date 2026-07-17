@@ -25,13 +25,25 @@ on:
         default: false
 
 jobs:
+  # GitHub auto-disables scheduled workflows after 60 days without repo
+  # activity; re-enabling ourselves on every scheduled run resets that timer.
+  keepalive:
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+    steps:
+      - name: Reset scheduled-workflow inactivity timer
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: >
+          gh api --method PUT
+          repos/${{ github.repository }}/actions/workflows/patch-and-build.yml/enable
+
   build:
     name: ${{ matrix.component }}
-    # Skip legs not selected on manual dispatch; always run all on schedule.
-    if: >-
-      github.event_name != 'workflow_dispatch' ||
-      github.event.inputs.component == 'all' ||
-      github.event.inputs.component == matrix.component
+    # (Legs not selected on manual dispatch are skipped inside the resolve
+    # step — the `matrix` context is not available in a job-level `if`.)
     runs-on: ubuntu-latest
     permissions:
       contents: write   # needed to create releases
@@ -81,8 +93,16 @@ jobs:
           COMPONENT: ${{ matrix.component }}
           MANUAL_REF: ${{ github.event.inputs.upstream_ref }}
           FORCE: ${{ github.event.inputs.force }}
+          SELECTED: ${{ github.event.inputs.component }}
         run: |
           set -euo pipefail
+
+          # Skip legs not selected on manual dispatch; always run all on schedule.
+          if [ -n "$SELECTED" ] && [ "$SELECTED" != "all" ] && [ "$SELECTED" != "$COMPONENT" ]; then
+            echo "$COMPONENT not selected (component=$SELECTED) — skipping"
+            echo "should_build=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
 
           if [ -n "$MANUAL_REF" ]; then
             if [[ "$MANUAL_REF" == epoch-* ]]; then

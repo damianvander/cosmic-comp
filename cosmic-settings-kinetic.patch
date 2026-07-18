@@ -16,11 +16,17 @@ index 493991d..24e673e 100644
  # cosmic-settings-config = { git = "https://github.com/pop-os/cosmic-settings-daemon//", branch = "input_nobuild" }
  
 diff --git a/cosmic-settings/src/pages/input/mod.rs b/cosmic-settings/src/pages/input/mod.rs
-index 10613dc..2d744f4 100644
+index 10613dc..dc4d83f 100644
 --- a/cosmic-settings/src/pages/input/mod.rs
 +++ b/cosmic-settings/src/pages/input/mod.rs
-@@ -9,8 +9,18 @@ use cosmic_comp_config::input::{
-     TapConfig,
+@@ -5,12 +5,22 @@ use crate::app;
+ use cosmic::Task;
+ use cosmic::cosmic_config::{self, ConfigGet, ConfigSet};
+ use cosmic_comp_config::input::{
+-    AccelConfig, AccelProfile, ClickMethod, InputConfig, ScrollConfig, ScrollMethod, TapButtonMap,
+-    TapConfig,
++    AccelConfig, AccelProfile, ClickMethod, InputConfig, KineticScrollConfig, ScrollConfig,
++    ScrollMethod, TapButtonMap, TapConfig,
  };
  use cosmic_settings_page as page;
 +use std::collections::HashMap;
@@ -38,7 +44,7 @@ index 10613dc..2d744f4 100644
  pub mod keyboard;
  pub mod mouse;
  pub mod touchpad;
-@@ -20,7 +30,12 @@ pub enum Message {
+@@ -20,7 +30,20 @@ pub enum Message {
      // seperate close message, to make sure another isn't closed?
      DisableWhileTyping(bool, bool),
      PrimaryButtonSelected(cosmic::widget::segmented_button::Entity, bool),
@@ -46,12 +52,20 @@ index 10613dc..2d744f4 100644
 +    PerAppScrollAppId(usize, String),
 +    PerAppScrollFactor(usize, String),
 +    PerAppScrollRemove(usize),
++    ResetKineticConfig(bool),
      SetAcceleration(bool, bool),
++    SetKineticFriction(f64, bool),
++    SetKineticMaxFling(f64, bool),
++    SetKineticMinFling(f64, bool),
++    SetKineticMotionCancel(f64, bool),
 +    SetKineticScroll(bool, bool),
++    SetKineticStopVelocity(f64, bool),
++    SetKineticTailDuration(f64, bool),
++    SetKineticVelocityWindow(u64, bool),
      SetMouseSpeed(f64, bool),
      SetNaturalScroll(bool, bool),
      SetSecondaryClickBehavior(Option<ClickMethod>, bool),
-@@ -35,6 +50,9 @@ pub struct Page {
+@@ -35,6 +58,9 @@ pub struct Page {
      #[allow(dead_code)]
      input_touchpad: InputConfig,
  
@@ -61,7 +75,7 @@ index 10613dc..2d744f4 100644
      // Mouse
      primary_button: cosmic::widget::segmented_button::SingleSelectModel,
  
-@@ -69,11 +87,15 @@ impl Default for Page {
+@@ -69,11 +95,15 @@ impl Default for Page {
          let idx = input_touchpad.left_handed.unwrap_or(false) as u16;
          touchpad_primary_button.activate_position(idx);
  
@@ -77,7 +91,7 @@ index 10613dc..2d744f4 100644
              // Mouse
              primary_button,
  
-@@ -83,6 +105,26 @@ impl Default for Page {
+@@ -83,6 +113,26 @@ impl Default for Page {
      }
  }
  
@@ -104,10 +118,21 @@ index 10613dc..2d744f4 100644
  impl Page {
      fn update_input<F: Fn(&mut InputConfig)>(&mut self, touchpad: bool, f: F) {
          let (name, input_config) = if touchpad {
-@@ -96,9 +138,62 @@ impl Page {
+@@ -96,9 +146,73 @@ impl Page {
          }
      }
  
++    /// Update one field of the kinetic-scrolling tunables, creating the
++    /// intermediate config structs on first write.
++    fn update_kinetic<F: Fn(&mut KineticScrollConfig)>(&mut self, touchpad: bool, f: F) {
++        self.update_input(touchpad, |x| {
++            f(x.scroll_config
++                .get_or_insert(ScrollConfig::default())
++                .kinetic_config
++                .get_or_insert(KineticScrollConfig::default()));
++        });
++    }
++
 +    /// Rebuild `scroll_factor_per_app` from the editable rows and persist it.
 +    /// Rows with an empty app id or an unparseable/non-positive factor are
 +    /// dropped from the written map but kept in the UI so editing continues.
@@ -167,7 +192,7 @@ index 10613dc..2d744f4 100644
              Message::SetAcceleration(value, touchpad) => {
                  let profile = if value {
                      AccelProfile::Adaptive
-@@ -121,6 +216,12 @@ impl Page {
+@@ -121,6 +235,46 @@ impl Page {
                  });
              }
  
@@ -177,22 +202,57 @@ index 10613dc..2d744f4 100644
 +                    .kinetic = Some(enabled);
 +            }),
 +
++            Message::ResetKineticConfig(touchpad) => self.update_input(touchpad, |x| {
++                x.scroll_config
++                    .get_or_insert(ScrollConfig::default())
++                    .kinetic_config = None;
++            }),
++
++            Message::SetKineticFriction(value, touchpad) => {
++                self.update_kinetic(touchpad, |k| k.friction_per_ms = Some(value));
++            }
++
++            Message::SetKineticMinFling(value, touchpad) => {
++                self.update_kinetic(touchpad, |k| k.min_fling_velocity = Some(value));
++            }
++
++            Message::SetKineticMaxFling(value, touchpad) => {
++                self.update_kinetic(touchpad, |k| k.max_fling_velocity = Some(value));
++            }
++
++            Message::SetKineticStopVelocity(value, touchpad) => {
++                self.update_kinetic(touchpad, |k| k.stop_velocity = Some(value));
++            }
++
++            Message::SetKineticTailDuration(value, touchpad) => {
++                self.update_kinetic(touchpad, |k| k.tail_duration_ms = Some(value));
++            }
++
++            Message::SetKineticVelocityWindow(value, touchpad) => {
++                self.update_kinetic(touchpad, |k| k.velocity_window_ms = Some(value));
++            }
++
++            Message::SetKineticMotionCancel(value, touchpad) => {
++                self.update_kinetic(touchpad, |k| k.motion_cancel_threshold = Some(value));
++            }
++
              Message::SetNaturalScroll(enabled, touchpad) => self.update_input(touchpad, |x| {
                  x.scroll_config
                      .get_or_insert(ScrollConfig::default())
 diff --git a/cosmic-settings/src/pages/input/touchpad.rs b/cosmic-settings/src/pages/input/touchpad.rs
-index 29d167c..828b5cc 100644
+index 29d167c..0096143 100644
 --- a/cosmic-settings/src/pages/input/touchpad.rs
 +++ b/cosmic-settings/src/pages/input/touchpad.rs
-@@ -43,6 +43,7 @@ impl page::Page<crate::pages::Message> for Page {
+@@ -43,6 +43,8 @@ impl page::Page<crate::pages::Message> for Page {
              sections.insert(touchpad()),
              sections.insert(click_behavior()),
              sections.insert(scrolling()),
++            sections.insert(kinetic_options()),
 +            sections.insert(per_app_scroll()),
              sections.insert(gestures()),
          ])
      }
-@@ -193,6 +194,8 @@ fn click_behavior() -> Section<crate::pages::Message> {
+@@ -193,6 +195,8 @@ fn click_behavior() -> Section<crate::pages::Message> {
  fn scrolling() -> Section<crate::pages::Message> {
      crate::slab!(descriptions {
          edge = fl!("scrolling", "edge");
@@ -201,7 +261,7 @@ index 29d167c..828b5cc 100644
          natural = fl!("scrolling", "natural");
          natural_desc = fl!("scrolling", "natural-desc");
          scroll_speed = fl!("scrolling", "speed");
-@@ -274,11 +277,77 @@ fn scrolling() -> Section<crate::pages::Message> {
+@@ -274,11 +278,269 @@ fn scrolling() -> Section<crate::pages::Message> {
                              |enabled| Message::SetNaturalScroll(enabled, true),
                          ),
                  )
@@ -216,6 +276,198 @@ index 29d167c..828b5cc 100644
 +                                .is_some_and(|conf| conf.kinetic.unwrap_or(false)),
 +                            |enabled| Message::SetKineticScroll(enabled, true),
 +                        ),
++                )
++                .apply(Element::from)
++                .map(crate::pages::Message::Input)
++        })
++}
++
++/// Built-in kinetic scrolling defaults, shown whenever the config holds no
++/// explicit value. Keep in sync with `KineticScrollConfig` in cosmic-comp.
++const KINETIC_DEFAULT_FRICTION_PER_MS: f64 = 0.995;
++const KINETIC_DEFAULT_MIN_FLING_VELOCITY: f64 = 50.0;
++const KINETIC_DEFAULT_MAX_FLING_VELOCITY: f64 = 4000.0;
++const KINETIC_DEFAULT_STOP_VELOCITY: f64 = 15.0;
++const KINETIC_DEFAULT_TAIL_DURATION_MS: f64 = 80.0;
++const KINETIC_DEFAULT_VELOCITY_WINDOW_MS: u64 = 80;
++const KINETIC_DEFAULT_MOTION_CANCEL_THRESHOLD: f64 = 2.0;
++
++/// A slider with its current value displayed alongside it, in the style of
++/// the scrolling-speed control.
++fn kinetic_slider<'a>(
++    display: String,
++    value: f64,
++    range: std::ops::RangeInclusive<f64>,
++    step: f64,
++    on_change: impl Fn(f64) -> Message + 'a,
++) -> Element<'a, Message> {
++    let slider = widget::slider(range, value, on_change)
++        .step(step)
++        .width(Length::Fill)
++        .apply(widget::container)
++        .max_width(250);
++
++    row::with_capacity(2)
++        .align_y(Alignment::Center)
++        .spacing(8)
++        .push(
++            text::body(display)
++                .width(Length::Fixed(48.0))
++                .align_x(Alignment::Center),
++        )
++        .push(slider)
++        .into()
++}
++
++fn kinetic_options() -> Section<crate::pages::Message> {
++    crate::slab!(descriptions {
++        desc = fl!("kinetic-options", "desc");
++        friction = fl!("kinetic-options", "friction");
++        friction_desc = fl!("kinetic-options", "friction-desc");
++        min_fling = fl!("kinetic-options", "min-fling");
++        min_fling_desc = fl!("kinetic-options", "min-fling-desc");
++        max_fling = fl!("kinetic-options", "max-fling");
++        max_fling_desc = fl!("kinetic-options", "max-fling-desc");
++        stop_velocity = fl!("kinetic-options", "stop-velocity");
++        stop_velocity_desc = fl!("kinetic-options", "stop-velocity-desc");
++        tail_duration = fl!("kinetic-options", "tail-duration");
++        tail_duration_desc = fl!("kinetic-options", "tail-duration-desc");
++        velocity_window = fl!("kinetic-options", "velocity-window");
++        velocity_window_desc = fl!("kinetic-options", "velocity-window-desc");
++        motion_cancel = fl!("kinetic-options", "motion-cancel");
++        motion_cancel_desc = fl!("kinetic-options", "motion-cancel-desc");
++        reset = fl!("kinetic-options", "reset");
++    });
++
++    Section::default()
++        .title(fl!("kinetic-options"))
++        .descriptions(descriptions)
++        .view::<Page>(move |binder, _page, section| {
++            let descriptions = &section.descriptions;
++            let page = binder
++                .page::<super::Page>()
++                .expect("input devices page not found");
++
++            let kinetic = page
++                .input_touchpad
++                .scroll_config
++                .as_ref()
++                .and_then(|x| x.kinetic_config)
++                .unwrap_or_default();
++
++            let friction_val = kinetic
++                .friction_per_ms
++                .unwrap_or(KINETIC_DEFAULT_FRICTION_PER_MS);
++            let min_fling_val = kinetic
++                .min_fling_velocity
++                .unwrap_or(KINETIC_DEFAULT_MIN_FLING_VELOCITY);
++            let max_fling_val = kinetic
++                .max_fling_velocity
++                .unwrap_or(KINETIC_DEFAULT_MAX_FLING_VELOCITY);
++            let stop_velocity_val = kinetic
++                .stop_velocity
++                .unwrap_or(KINETIC_DEFAULT_STOP_VELOCITY);
++            let tail_duration_val = kinetic
++                .tail_duration_ms
++                .unwrap_or(KINETIC_DEFAULT_TAIL_DURATION_MS);
++            let velocity_window_val = kinetic
++                .velocity_window_ms
++                .unwrap_or(KINETIC_DEFAULT_VELOCITY_WINDOW_MS)
++                as f64;
++            let motion_cancel_val = kinetic
++                .motion_cancel_threshold
++                .unwrap_or(KINETIC_DEFAULT_MOTION_CANCEL_THRESHOLD);
++
++            settings::section()
++                .title(&section.title)
++                .add(text::body(&descriptions[desc]))
++                // Per-ms velocity multiplier during the decay phase
++                .add(
++                    settings::item::builder(&descriptions[friction])
++                        .description(&descriptions[friction_desc])
++                        .flex_control(kinetic_slider(
++                            format!("{friction_val:.3}"),
++                            friction_val,
++                            0.980..=0.999,
++                            0.001,
++                            |value| Message::SetKineticFriction(value, true),
++                        )),
++                )
++                // Minimum lift velocity that starts a fling
++                .add(
++                    settings::item::builder(&descriptions[min_fling])
++                        .description(&descriptions[min_fling_desc])
++                        .flex_control(kinetic_slider(
++                            format!("{min_fling_val:.0}"),
++                            min_fling_val,
++                            0.0..=300.0,
++                            5.0,
++                            |value| Message::SetKineticMinFling(value, true),
++                        )),
++                )
++                // Cap on the initial fling velocity
++                .add(
++                    settings::item::builder(&descriptions[max_fling])
++                        .description(&descriptions[max_fling_desc])
++                        .flex_control(kinetic_slider(
++                            format!("{max_fling_val:.0}"),
++                            max_fling_val,
++                            500.0..=10000.0,
++                            100.0,
++                            |value| Message::SetKineticMaxFling(value, true),
++                        )),
++                )
++                // Velocity at which the fling hands over to the smooth-stop tail
++                .add(
++                    settings::item::builder(&descriptions[stop_velocity])
++                        .description(&descriptions[stop_velocity_desc])
++                        .flex_control(kinetic_slider(
++                            format!("{stop_velocity_val:.0}"),
++                            stop_velocity_val,
++                            1.0..=100.0,
++                            1.0,
++                            |value| Message::SetKineticStopVelocity(value, true),
++                        )),
++                )
++                // Duration of the ease-out tail
++                .add(
++                    settings::item::builder(&descriptions[tail_duration])
++                        .description(&descriptions[tail_duration_desc])
++                        .flex_control(kinetic_slider(
++                            format!("{tail_duration_val:.0}"),
++                            tail_duration_val,
++                            0.0..=300.0,
++                            5.0,
++                            |value| Message::SetKineticTailDuration(value, true),
++                        )),
++                )
++                // Sample window used to estimate the fling velocity
++                .add(
++                    settings::item::builder(&descriptions[velocity_window])
++                        .description(&descriptions[velocity_window_desc])
++                        .flex_control(kinetic_slider(
++                            format!("{velocity_window_val:.0}"),
++                            velocity_window_val,
++                            20.0..=200.0,
++                            5.0,
++                            |value| Message::SetKineticVelocityWindow(value.round() as u64, true),
++                        )),
++                )
++                // Accumulated pointer motion that cancels a fling
++                .add(
++                    settings::item::builder(&descriptions[motion_cancel])
++                        .description(&descriptions[motion_cancel_desc])
++                        .flex_control(kinetic_slider(
++                            format!("{motion_cancel_val:.1}"),
++                            motion_cancel_val,
++                            0.0..=20.0,
++                            0.5,
++                            |value| Message::SetKineticMotionCancel(value, true),
++                        )),
++                )
++                .add(
++                    widget::button::standard(&descriptions[reset])
++                        .on_press(Message::ResetKineticConfig(true)),
 +                )
                  .apply(Element::from)
                  .map(crate::pages::Message::Input)
@@ -280,15 +532,33 @@ index 29d167c..828b5cc 100644
      crate::slab!(descriptions {
          switch_workspaces = fl!("switch-workspaces");
 diff --git a/i18n/en/cosmic_settings.ftl b/i18n/en/cosmic_settings.ftl
-index eb2babe..2414cc9 100644
+index eb2babe..7a65ca2 100644
 --- a/i18n/en/cosmic_settings.ftl
 +++ b/i18n/en/cosmic_settings.ftl
-@@ -689,6 +689,14 @@ scrolling = Scrolling
+@@ -689,6 +689,32 @@ scrolling = Scrolling
      .speed = Scrolling speed
      .natural = Natural scrolling
      .natural-desc = Scroll the content, instead of the view
 +    .kinetic = Smooth scrolling
 +    .kinetic-desc = Continue scrolling with momentum after lifting your fingers
++
++kinetic-options = Smooth scrolling options
++    .desc = Fine-tune the momentum glide used when Smooth scrolling is enabled. Sliders show the built-in defaults until a value is changed.
++    .friction = Glide friction
++    .friction-desc = Fraction of velocity kept per millisecond; closer to 1.000 glides longer
++    .min-fling = Minimum fling velocity
++    .min-fling-desc = Slowest finger-lift speed (px/s) that still starts a glide
++    .max-fling = Maximum fling velocity
++    .max-fling-desc = Cap on the starting glide speed (px/s)
++    .stop-velocity = Stop velocity
++    .stop-velocity-desc = Glide speed (px/s) below which scrolling eases to a stop
++    .tail-duration = Stop tail duration
++    .tail-duration-desc = Length (ms) of the ease-out that ends a glide
++    .velocity-window = Velocity sample window
++    .velocity-window-desc = Time window (ms) of finger motion used to estimate the fling speed
++    .motion-cancel = Motion cancel threshold
++    .motion-cancel-desc = Pointer movement (px) during a glide that cancels it
++    .reset = Reset to defaults
 +
 +per-app-scroll = Per-app scroll speed
 +    .desc = Multiply the scroll speed for specific applications. Use the app's Wayland app ID or X11 WM_CLASS as the identifier, and a multiplier (1.0 = unchanged, below 1.0 = slower, above 1.0 = faster).

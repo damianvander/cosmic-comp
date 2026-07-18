@@ -1,5 +1,5 @@
 diff --git a/cosmic-comp-config/src/input.rs b/cosmic-comp-config/src/input.rs
-index df6f34c..43eccbc 100644
+index df6f34c2..13eb111d 100644
 --- a/cosmic-comp-config/src/input.rs
 +++ b/cosmic-comp-config/src/input.rs
 @@ -4,6 +4,7 @@
@@ -10,7 +10,7 @@ index df6f34c..43eccbc 100644
  
  // Note: For the following values, None is used to represent the system default
  // Configuration for input devices
-@@ -47,6 +48,14 @@ pub struct ScrollConfig {
+@@ -47,6 +48,51 @@ pub struct ScrollConfig {
      pub natural_scroll: Option<bool>,
      pub scroll_button: Option<u32>,
      pub scroll_factor: Option<f64>,
@@ -22,27 +22,73 @@ index df6f34c..43eccbc 100644
 +    /// scroll distance across apps that interpret wheel/value120 differently.
 +    #[serde(skip_serializing_if = "Option::is_none", default)]
 +    pub scroll_factor_per_app: Option<HashMap<String, f64>>,
++    /// Tunables for kinetic scrolling. Only consulted when `kinetic` is
++    /// enabled; `None` (or any `None` field) falls back to built-in defaults.
++    #[serde(skip_serializing_if = "Option::is_none", default)]
++    pub kinetic_config: Option<KineticScrollConfig>,
++}
++
++/// Tunables for compositor-side kinetic (inertial) scrolling. Every field is
++/// optional; `None` means the built-in default noted per field.
++#[derive(Clone, Copy, Debug, Default, PartialEq, Deserialize, Serialize)]
++pub struct KineticScrollConfig {
++    /// Per-millisecond velocity multiplier during the decay phase
++    /// (0 < x < 1). Closer to 1.0 = longer glide. Default 0.995.
++    #[serde(skip_serializing_if = "Option::is_none", default)]
++    pub friction_per_ms: Option<f64>,
++    /// Minimum finger-lift velocity (logical px/sec) required to start a
++    /// fling. Default 50.0.
++    #[serde(skip_serializing_if = "Option::is_none", default)]
++    pub min_fling_velocity: Option<f64>,
++    /// Cap on the initial fling velocity (logical px/sec). Default 4000.0.
++    #[serde(skip_serializing_if = "Option::is_none", default)]
++    pub max_fling_velocity: Option<f64>,
++    /// Velocity (logical px/sec) below which the fling hands over to the
++    /// smooth-stop tail. Default 15.0.
++    #[serde(skip_serializing_if = "Option::is_none", default)]
++    pub stop_velocity: Option<f64>,
++    /// Duration (ms) of the cubic ease-out tail that ends a fling.
++    /// Default 80.0.
++    #[serde(skip_serializing_if = "Option::is_none", default)]
++    pub tail_duration_ms: Option<f64>,
++    /// Window (ms) of finger samples before lift used to estimate the fling
++    /// velocity. Default 80.
++    #[serde(skip_serializing_if = "Option::is_none", default)]
++    pub velocity_window_ms: Option<u64>,
++    /// Accumulated pointer motion (logical px) during a fling that cancels
++    /// it. Default 2.0.
++    #[serde(skip_serializing_if = "Option::is_none", default)]
++    pub motion_cancel_threshold: Option<f64>,
  }
  
  #[derive(Copy, Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 diff --git a/src/config/input_config.rs b/src/config/input_config.rs
-index ae74da6..1e1ea05 100644
+index ae74da68..70f5cb2d 100644
 --- a/src/config/input_config.rs
 +++ b/src/config/input_config.rs
-@@ -65,6 +65,8 @@ pub fn for_device(device: &InputDevice) -> InputConfig {
+@@ -65,6 +65,9 @@ pub fn for_device(device: &InputDevice) -> InputConfig {
                      None
                  },
                  scroll_factor: None,
 +                kinetic: None,
 +                scroll_factor_per_app: None,
++                kinetic_config: None,
              })
          } else {
              None
 diff --git a/src/config/mod.rs b/src/config/mod.rs
-index 1d9b9c9..6217d36 100644
+index 1d9b9c92..dfc8b929 100644
 --- a/src/config/mod.rs
 +++ b/src/config/mod.rs
-@@ -622,6 +622,35 @@ impl Config {
+@@ -1,6 +1,7 @@
+ // SPDX-License-Identifier: GPL-3.0-only
+ 
+ use crate::{
++    input::kinetic::KineticParams,
+     shell::Shell,
+     state::{BackendData, State},
+     utils::prelude::OutputExt,
+@@ -622,6 +623,73 @@ impl Config {
          .map_or(1.0, |x| x.0)
      }
  
@@ -52,6 +98,44 @@ index 1d9b9c9..6217d36 100644
 +            x.scroll_config.as_ref()?.kinetic
 +        })
 +        .is_some_and(|x| x.0)
++    }
++
++    /// Resolve the kinetic-scroll tunables for a device: fetch the optional
++    /// `kinetic_config` (device config first, falling back to the default
++    /// config) and resolve each unset field to its built-in default.
++    pub fn kinetic_scroll_params(&self, device: &InputDevice) -> KineticParams {
++        let (device_config, default_config) = self.get_device_config(device);
++        let cfg = input_config::get_config(device_config.as_ref(), default_config, |x| {
++            x.scroll_config.as_ref()?.kinetic_config
++        })
++        .map(|x| x.0);
++
++        let mut params = KineticParams::default();
++        let Some(cfg) = cfg else {
++            return params;
++        };
++        if let Some(v) = cfg.friction_per_ms {
++            params.friction_per_ms = v;
++        }
++        if let Some(v) = cfg.min_fling_velocity {
++            params.min_fling_velocity = v;
++        }
++        if let Some(v) = cfg.max_fling_velocity {
++            params.max_fling_velocity = v;
++        }
++        if let Some(v) = cfg.stop_velocity {
++            params.stop_velocity = v;
++        }
++        if let Some(v) = cfg.tail_duration_ms {
++            params.tail_duration_ms = v;
++        }
++        if let Some(v) = cfg.velocity_window_ms {
++            params.velocity_window = std::time::Duration::from_millis(v);
++        }
++        if let Some(v) = cfg.motion_cancel_threshold {
++            params.motion_cancel_threshold = v;
++        }
++        params
 +    }
 +
 +    /// Resolve the effective scroll factor for a device, combined with any
@@ -80,10 +164,10 @@ index 1d9b9c9..6217d36 100644
          Some(
 diff --git a/src/input/kinetic.rs b/src/input/kinetic.rs
 new file mode 100644
-index 0000000..a5717e6
+index 00000000..85654944
 --- /dev/null
 +++ b/src/input/kinetic.rs
-@@ -0,0 +1,307 @@
+@@ -0,0 +1,427 @@
 +// SPDX-License-Identifier: GPL-3.0-only
 +//
 +// Compositor-side kinetic (inertial) scrolling for two-finger touchpad scroll.
@@ -106,27 +190,60 @@ index 0000000..a5717e6
 +use std::{cell::RefCell, collections::VecDeque, time::Duration};
 +
 +/// Samples within this window of the most recent push contribute to the
-+/// fling velocity at lift; older samples are dropped by [`trim`]. Biases
-+/// the velocity estimate toward what the finger was doing *just* before
++/// fling velocity at lift; older samples are dropped by [`KineticScroller::trim`].
++/// Biases the velocity estimate toward what the finger was doing *just* before
 +/// release rather than averaging across the whole gesture.
-+const VELOCITY_WINDOW: Duration = Duration::from_millis(80);
++pub const DEFAULT_VELOCITY_WINDOW: Duration = Duration::from_millis(80);
 +/// Minimum raw lift velocity (logical units/sec) required to start a fling.
-+const MIN_FLING_VELOCITY: f64 = 50.0;
++pub const DEFAULT_MIN_FLING_VELOCITY: f64 = 50.0;
 +/// Velocity (logical units/sec) at which exponential decay hands over to the
 +/// smooth-stop tail.
-+const STOP_VELOCITY: f64 = 15.0;
++pub const DEFAULT_STOP_VELOCITY: f64 = 15.0;
 +/// Per-millisecond friction during the exponential decay phase.
-+const FRICTION_PER_MS: f64 = 0.995;
++pub const DEFAULT_FRICTION_PER_MS: f64 = 0.995;
 +/// Cap on initial fling velocity so an extreme flick doesn't whip-scroll the
 +/// entire page in one frame.
-+const MAX_FLING_VELOCITY: f64 = 4000.0;
++pub const DEFAULT_MAX_FLING_VELOCITY: f64 = 4000.0;
 +/// Duration of the smooth-stop tail (cubic ease-out to zero) that follows
-+/// exponential decay. Without it, the fling cuts off abruptly at
-+/// `STOP_VELOCITY` which can feel like a snap on low-precision scroll
-+/// consumers (terminals, XWayland clients).
-+const TAIL_DURATION_MS: f64 = 80.0;
++/// exponential decay. Without it, the fling cuts off abruptly at the stop
++/// velocity which can feel like a snap on low-precision scroll consumers
++/// (terminals, XWayland clients).
++pub const DEFAULT_TAIL_DURATION_MS: f64 = 80.0;
++/// Accumulated relative pointer motion (logical px) during a fling that
++/// cancels it. Small but non-zero: finger-lift can produce sub-pixel jitter
++/// motion events at the exact moment a fling starts, and cancelling on
++/// literally any motion would kill most flings instantly.
++pub const DEFAULT_MOTION_CANCEL_THRESHOLD: f64 = 2.0;
 +/// Tick interval for the fling timer (~125 Hz).
 +const TICK: Duration = Duration::from_millis(8);
++
++/// Kinetic-scroll tunables with every option resolved to a concrete value.
++/// Produced from `KineticScrollConfig` by `Config::kinetic_scroll_params`;
++/// [`Default`] is the built-in `DEFAULT_*` constants above.
++#[derive(Clone, Copy, Debug)]
++pub struct KineticParams {
++    pub friction_per_ms: f64,
++    pub min_fling_velocity: f64,
++    pub max_fling_velocity: f64,
++    pub stop_velocity: f64,
++    pub tail_duration_ms: f64,
++    pub velocity_window: Duration,
++    pub motion_cancel_threshold: f64,
++}
++
++impl Default for KineticParams {
++    fn default() -> Self {
++        Self {
++            friction_per_ms: DEFAULT_FRICTION_PER_MS,
++            min_fling_velocity: DEFAULT_MIN_FLING_VELOCITY,
++            max_fling_velocity: DEFAULT_MAX_FLING_VELOCITY,
++            stop_velocity: DEFAULT_STOP_VELOCITY,
++            tail_duration_ms: DEFAULT_TAIL_DURATION_MS,
++            velocity_window: DEFAULT_VELOCITY_WINDOW,
++            motion_cancel_threshold: DEFAULT_MOTION_CANCEL_THRESHOLD,
++        }
++    }
++}
 +
 +#[derive(Clone, Copy, Debug)]
 +struct Sample {
@@ -143,11 +260,18 @@ index 0000000..a5717e6
 +    velocity: Point<f64, Logical>,
 +    active: bool,
 +    last_tick: Option<Duration>,
-+    /// True once exponential decay has dropped below [`STOP_VELOCITY`] and
++    /// True once exponential decay has dropped below the stop velocity and
 +    /// we've switched to the cubic-ease-out tail.
 +    in_tail: bool,
 +    tail_start: Option<Duration>,
 +    tail_initial_velocity: Point<f64, Logical>,
++    /// Resolved tunables, refreshed from config on every [`KineticScroller::push`];
++    /// a running fling uses whatever was stored at gesture time.
++    params: KineticParams,
++    /// Relative pointer motion (logical px) accumulated while a fling is
++    /// active; once it exceeds `params.motion_cancel_threshold` the fling is
++    /// cancelled.
++    motion_accum: f64,
 +}
 +
 +impl Inner {
@@ -158,6 +282,7 @@ index 0000000..a5717e6
 +        self.in_tail = false;
 +        self.tail_start = None;
 +        self.tail_initial_velocity = Point::default();
++        self.motion_accum = 0.0;
 +    }
 +}
 +
@@ -174,26 +299,29 @@ index 0000000..a5717e6
 +}
 +
 +impl KineticScroller {
-+    /// Buffer a finger delta. If a fling was running, cancel it and return
-+    /// `true` so the caller can terminate that fling's scroll sequence.
-+    fn push(&self, delta: Point<f64, Logical>, t: Duration) -> bool {
++    /// Buffer a finger delta and refresh the resolved tunables. If a fling
++    /// was running, cancel it and return `true` so the caller can terminate
++    /// that fling's scroll sequence.
++    fn push(&self, delta: Point<f64, Logical>, t: Duration, params: KineticParams) -> bool {
 +        let mut inner = self.0.borrow_mut();
++        inner.params = params;
 +        let was_active = inner.active;
 +        if inner.active {
 +            inner.clear_fling();
 +        }
 +        inner.samples.push_back(Sample { delta, time: t });
-+        Self::trim(&mut inner.samples, t);
++        Self::trim(&mut inner.samples, t, params.velocity_window);
 +        was_active
 +    }
 +
-+    /// Compute velocity from buffered samples and, if above
-+    /// `MIN_FLING_VELOCITY`, start the fling. Returns the initial velocity
-+    /// when a fling actually starts. The buffer is already trimmed to
-+    /// `VELOCITY_WINDOW` by [`push`], so `first`/`last` are the velocity
++    /// Compute velocity from buffered samples and, if above the resolved
++    /// minimum fling velocity, start the fling. Returns the initial velocity
++    /// when a fling actually starts. The buffer is already trimmed to the
++    /// velocity window by [`Self::push`], so `first`/`last` are the velocity
 +    /// window directly — no further filtering needed.
 +    fn start_fling(&self) -> Option<Point<f64, Logical>> {
 +        let mut inner = self.0.borrow_mut();
++        let params = inner.params;
 +        let (first, last) = inner.samples.front().zip(inner.samples.back())?;
 +        let span = last.time.saturating_sub(first.time).as_secs_f64();
 +        let total = inner
@@ -206,13 +334,15 @@ index 0000000..a5717e6
 +            return None;
 +        }
 +        let raw = Point::<f64, Logical>::from((total.x / span, total.y / span));
-+        if raw.x.abs() < MIN_FLING_VELOCITY && raw.y.abs() < MIN_FLING_VELOCITY {
++        if raw.x.abs() < params.min_fling_velocity && raw.y.abs() < params.min_fling_velocity {
 +            return None;
 +        }
 +
 +        let velocity = Point::<f64, Logical>::from((
-+            raw.x.clamp(-MAX_FLING_VELOCITY, MAX_FLING_VELOCITY),
-+            raw.y.clamp(-MAX_FLING_VELOCITY, MAX_FLING_VELOCITY),
++            raw.x
++                .clamp(-params.max_fling_velocity, params.max_fling_velocity),
++            raw.y
++                .clamp(-params.max_fling_velocity, params.max_fling_velocity),
 +        ));
 +        inner.clear_fling();
 +        inner.velocity = velocity;
@@ -228,6 +358,7 @@ index 0000000..a5717e6
 +            return Tick::Idle;
 +        }
 +
++        let params = inner.params;
 +        let last = inner.last_tick.unwrap_or(now);
 +        let dt_ms = now.saturating_sub(last).as_secs_f64() * 1000.0;
 +        inner.last_tick = Some(now);
@@ -237,12 +368,12 @@ index 0000000..a5717e6
 +                .tail_start
 +                .expect("tail_start set when in_tail is true");
 +            let elapsed_ms = now.saturating_sub(start).as_secs_f64() * 1000.0;
-+            if elapsed_ms >= TAIL_DURATION_MS {
++            if elapsed_ms >= params.tail_duration_ms {
 +                inner.clear_fling();
 +                return Tick::Done;
 +            }
 +            // Cubic ease-out position curve: velocity(t) = v0 * (1 - t/T)^2.
-+            let t_norm = elapsed_ms / TAIL_DURATION_MS;
++            let t_norm = elapsed_ms / params.tail_duration_ms;
 +            let v_factor = (1.0 - t_norm).powi(2);
 +            let v = inner.tail_initial_velocity;
 +            let cur_v = (v.x * v_factor, v.y * v_factor);
@@ -252,8 +383,8 @@ index 0000000..a5717e6
 +        }
 +
 +        let delta = if dt_ms > 0.0 {
-+            let factor = FRICTION_PER_MS.powf(dt_ms);
-+            let scale = (factor - 1.0) / FRICTION_PER_MS.ln() / 1000.0;
++            let factor = params.friction_per_ms.powf(dt_ms);
++            let scale = (factor - 1.0) / params.friction_per_ms.ln() / 1000.0;
 +            let v = inner.velocity;
 +            let out = Point::from((v.x * scale, v.y * scale));
 +            inner.velocity = Point::from((v.x * factor, v.y * factor));
@@ -262,7 +393,9 @@ index 0000000..a5717e6
 +            Point::default()
 +        };
 +
-+        if inner.velocity.x.abs() < STOP_VELOCITY && inner.velocity.y.abs() < STOP_VELOCITY {
++        if inner.velocity.x.abs() < params.stop_velocity
++            && inner.velocity.y.abs() < params.stop_velocity
++        {
 +            // Hand off from exponential decay to the smooth-stop tail.
 +            inner.in_tail = true;
 +            inner.tail_start = Some(now);
@@ -277,9 +410,39 @@ index 0000000..a5717e6
 +        inner.samples.clear();
 +    }
 +
-+    fn trim(samples: &mut VecDeque<Sample>, latest: Duration) {
++    /// Cancel a running fling (and any buffered samples), reporting whether
++    /// one was actually active so the caller can decide to [`emit_stop`].
++    fn cancel_if_active(&self) -> bool {
++        let mut inner = self.0.borrow_mut();
++        let was_active = inner.active;
++        inner.clear_fling();
++        inner.samples.clear();
++        was_active
++    }
++
++    /// Accumulate relative pointer motion while a fling is active. Returns
++    /// `true` when the accumulated magnitude crosses the resolved
++    /// `motion_cancel_threshold` and the fling was cancelled — the caller
++    /// must then [`emit_stop`] to terminate the scroll sequence.
++    fn accumulate_motion(&self, delta: Point<f64, Logical>) -> bool {
++        let mut inner = self.0.borrow_mut();
++        if !inner.active {
++            // Cheap early-out: this runs on the hot pointer-motion path.
++            return false;
++        }
++        inner.motion_accum += delta.x.hypot(delta.y);
++        if inner.motion_accum > inner.params.motion_cancel_threshold {
++            inner.clear_fling();
++            inner.samples.clear();
++            true
++        } else {
++            false
++        }
++    }
++
++    fn trim(samples: &mut VecDeque<Sample>, latest: Duration, window: Duration) {
 +        while let Some(front) = samples.front() {
-+            if latest <= front.time + VELOCITY_WINDOW {
++            if latest <= front.time + window {
 +                break;
 +            }
 +            samples.pop_front();
@@ -301,16 +464,57 @@ index 0000000..a5717e6
 +    }
 +}
 +
-+/// Buffer a finger delta. Cancels any running fling so a renewed gesture
-+/// starts cleanly. Returns `true` if a fling was cancelled — the caller
-+/// should then [`emit_stop`] to terminate that fling's scroll sequence so
-+/// clients don't merge it with the new gesture.
++/// Buffer a finger delta and refresh the scroller's resolved tunables.
++/// Cancels any running fling so a renewed gesture starts cleanly. Returns
++/// `true` if a fling was cancelled — the caller should then [`emit_stop`] to
++/// terminate that fling's scroll sequence so clients don't merge it with the
++/// new gesture.
 +#[must_use]
-+pub fn push(seat: &Seat<State>, delta: Point<f64, Logical>, t: Duration) -> bool {
++pub fn push(
++    seat: &Seat<State>,
++    delta: Point<f64, Logical>,
++    t: Duration,
++    params: KineticParams,
++) -> bool {
 +    seat.user_data()
 +        .get::<KineticScroller>()
-+        .map(|scroller| scroller.push(delta, t))
++        .map(|scroller| scroller.push(delta, t, params))
 +        .unwrap_or(false)
++}
++
++/// Feed a relative pointer-motion delta. No-op unless a fling is active; once
++/// the motion accumulated since the fling started exceeds the resolved
++/// `motion_cancel_threshold`, the fling is cancelled and an `axis_stop` frame
++/// is emitted so the client's `Continuous` scroll sequence terminates cleanly
++/// (otherwise clients keep scroll-axis lock).
++pub fn on_pointer_motion(
++    state: &mut State,
++    seat: &Seat<State>,
++    delta: Point<f64, Logical>,
++    time_msec: u32,
++) {
++    let cancelled = seat
++        .user_data()
++        .get::<KineticScroller>()
++        .map(|scroller| scroller.accumulate_motion(delta))
++        .unwrap_or(false);
++    if cancelled {
++        emit_stop(state, seat, time_msec);
++    }
++}
++
++/// Cancel any running fling, emitting a terminating `axis_stop` if one was
++/// actually active. Used by absolute-positioning motion (tablets, VMs) where
++/// there is no meaningful delta to accumulate — any motion cancels.
++pub fn cancel_with_stop(state: &mut State, seat: &Seat<State>, time_msec: u32) {
++    let was_active = seat
++        .user_data()
++        .get::<KineticScroller>()
++        .map(|scroller| scroller.cancel_if_active())
++        .unwrap_or(false);
++    if was_active {
++        emit_stop(state, seat, time_msec);
++    }
 +}
 +
 +/// Emit a `Continuous` `axis_stop` on both axes to delimit the end of a
@@ -392,7 +596,7 @@ index 0000000..a5717e6
 +    schedule_tick(state, seat);
 +}
 diff --git a/src/input/mod.rs b/src/input/mod.rs
-index 1114d50..e5356c8 100644
+index 1114d50b..9aac3bf4 100644
 --- a/src/input/mod.rs
 +++ b/src/input/mod.rs
 @@ -14,7 +14,7 @@ use crate::{
@@ -423,17 +627,20 @@ index 1114d50..e5356c8 100644
                      let serial = SERIAL_COUNTER.next_serial();
                      let time = Event::time_msec(&event);
                      let keyboard = seat.get_keyboard().unwrap();
-@@ -357,6 +362,9 @@ impl State {
+@@ -357,6 +362,12 @@ impl State {
                      }
  
                      std::mem::drop(shell);
 +
-+
++                    // Moving the mouse during a kinetic fling cancels it once
++                    // the accumulated motion exceeds a small threshold (see
++                    // `kinetic::on_pointer_motion`).
++                    kinetic::on_pointer_motion(self, &seat, event.delta(), event.time_msec());
 +
                      ptr.relative_motion(
                          self,
                          under.clone(),
-@@ -579,6 +587,14 @@ impl State {
+@@ -579,6 +590,14 @@ impl State {
                      };
  
                      drop(shell);
@@ -448,7 +655,18 @@ index 1114d50..e5356c8 100644
                      if pointer_confined && new_under.is_none() {
                          ptr.frame(self);
                          return;
-@@ -775,6 +791,7 @@ impl State {
+@@ -683,6 +702,10 @@ impl State {
+                 if let Some(seat) = maybe_seat {
+                     self.common.idle_notifier_state.notify_activity(&seat);
+                     notify_cursor_activity(self, &seat);
++                    // Absolute-positioning devices (tablets, VMs) have no
++                    // motion delta to accumulate — any motion while a fling
++                    // is active cancels it (with a terminating axis_stop).
++                    kinetic::cancel_with_stop(self, &seat, event.time_msec());
+                     let output = seat.active_output();
+                     let output_geometry = output.geometry();
+                     let position = output_geometry.loc.to_f64()
+@@ -775,6 +798,7 @@ impl State {
  
                  let mut pass_event = !seat.supressed_buttons().remove(button);
                  if event.state() == ButtonState::Pressed {
@@ -456,7 +674,7 @@ index 1114d50..e5356c8 100644
                      // change the keyboard focus unless the pointer is grabbed
                      // We test for any matching surface type here but always use the root
                      // (in case of a window the toplevel) surface for the focus.
-@@ -952,13 +969,6 @@ impl State {
+@@ -952,13 +976,6 @@ impl State {
                  }
              }
              InputEvent::PointerAxis { event, .. } => {
@@ -470,33 +688,28 @@ index 1114d50..e5356c8 100644
                  let maybe_seat = self
                      .common
                      .shell
-@@ -966,6 +976,25 @@ impl State {
+@@ -966,6 +983,20 @@ impl State {
                      .seats
                      .for_device(&event.device())
                      .cloned();
 +                let app_id = maybe_seat.as_ref().and_then(focused_app_id);
-+                let (scroll_factor, kinetic_enabled) =
++                let (scroll_factor, kinetic_enabled, kinetic_params) =
 +                    if let Some(device) = <dyn Any>::downcast_ref::<InputDevice>(&event.device()) {
 +                        (
 +                            self.common
 +                                .config
 +                                .scroll_factor_for_app(device, app_id.as_deref()),
 +                            self.common.config.kinetic_scroll_enabled(device),
++                            self.common.config.kinetic_scroll_params(device),
 +                        )
 +                    } else {
-+                        (1.0, false)
++                        (1.0, false, kinetic::KineticParams::default())
 +                    };
-+                tracing::error!(
-+                    target: "cosmic_comp::input::scroll",
-+                    "scroll axis: app_id={:?} scroll_factor={:.3}",
-+                    app_id.as_deref().unwrap_or("(none)"),
-+                    scroll_factor,
-+                );
 +
                  if let Some(seat) = maybe_seat {
                      self.common.idle_notifier_state.notify_activity(&seat);
                      notify_cursor_activity(self, &seat);
-@@ -978,6 +1007,7 @@ impl State {
+@@ -978,6 +1009,7 @@ impl State {
                              .accessibility_zoom
                              .enable_mouse_zoom_shortcuts
                      {
@@ -504,7 +717,7 @@ index 1114d50..e5356c8 100644
                          seat.modifiers_shortcut_queue().clear();
                          if let Some(mut percentage) = event
                              .amount_v120(Axis::Vertical)
-@@ -999,7 +1029,50 @@ impl State {
+@@ -999,7 +1031,50 @@ impl State {
                              self.update_zoom(&seat, change, event.source() == AxisSource::Wheel);
                          }
                      } else {
@@ -541,7 +754,7 @@ index 1114d50..e5356c8 100644
 +                                dx_raw * scroll_factor,
 +                                dy_raw * scroll_factor,
 +                            ));
-+                            if kinetic::push(&seat, delta, t) {
++                            if kinetic::push(&seat, delta, t, kinetic_params) {
 +                                kinetic::emit_stop(self, &seat, event.time_msec());
 +                            }
 +                        }
@@ -556,7 +769,7 @@ index 1114d50..e5356c8 100644
                          if let Some(horizontal_amount) = event.amount(Axis::Horizontal) {
                              if horizontal_amount != 0.0 {
                                  frame = frame
-@@ -1010,7 +1083,7 @@ impl State {
+@@ -1010,7 +1085,7 @@ impl State {
                                          (discrete * scroll_factor).round() as i32,
                                      );
                                  }
@@ -565,7 +778,7 @@ index 1114d50..e5356c8 100644
                                  frame = frame.stop(Axis::Horizontal);
                              }
                          }
-@@ -1024,7 +1097,7 @@ impl State {
+@@ -1024,7 +1099,7 @@ impl State {
                                          (discrete * scroll_factor).round() as i32,
                                      );
                                  }
@@ -574,7 +787,7 @@ index 1114d50..e5356c8 100644
                                  frame = frame.stop(Axis::Vertical);
                              }
                          }
-@@ -1283,6 +1356,12 @@ impl State {
+@@ -1283,6 +1358,12 @@ impl State {
                      .cloned();
                  if let Some(seat) = maybe_seat {
                      self.common.idle_notifier_state.notify_activity(&seat);
@@ -587,7 +800,7 @@ index 1114d50..e5356c8 100644
                      let serial = SERIAL_COUNTER.next_serial();
                      let pointer = seat.get_pointer().unwrap();
                      pointer.gesture_hold_begin(
-@@ -2486,6 +2565,25 @@ impl State {
+@@ -2486,6 +2567,25 @@ impl State {
      }
  }
  
@@ -614,7 +827,7 @@ index 1114d50..e5356c8 100644
  fn cursor_sessions_for_output<'a>(
      shell: &'a Shell,
 diff --git a/src/shell/focus/mod.rs b/src/shell/focus/mod.rs
-index 9374230..5deecaa 100644
+index 9374230a..5deecaaf 100644
 --- a/src/shell/focus/mod.rs
 +++ b/src/shell/focus/mod.rs
 @@ -342,6 +342,13 @@ fn update_focus_state(
@@ -632,7 +845,7 @@ index 9374230..5deecaa 100644
      if let Some(keyboard) = seat.get_keyboard() {
          // remove constraint when target changed
 diff --git a/src/shell/seats.rs b/src/shell/seats.rs
-index 5273e97..566c995 100644
+index 5273e97f..566c9953 100644
 --- a/src/shell/seats.rs
 +++ b/src/shell/seats.rs
 @@ -5,7 +5,7 @@ use std::{any::Any, cell::RefCell, collections::HashMap, sync::Mutex};

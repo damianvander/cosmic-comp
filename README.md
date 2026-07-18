@@ -4,6 +4,22 @@ A **patch/overlay repo** for [COSMIC](https://github.com/pop-os) that adds
 compositor-side **kinetic (smooth) scrolling** with **per-app scroll-factor
 overrides**, plus a settings-app UI toggle to enable it.
 
+## Quick install
+
+Prebuilt patched binaries (Arch/CachyOS — see [CI](#ci)), matched to your
+installed COSMIC epoch:
+
+```bash
+# compositor (kinetic scroll engine + per-app scroll factors)
+curl -fsSL https://raw.githubusercontent.com/damianvander/cosmic-comp/master/install-kinetic.sh | bash
+
+# settings app (smooth-scrolling toggle + per-app scroll speed UI)
+curl -fsSL https://raw.githubusercontent.com/damianvander/cosmic-comp/master/install-kinetic.sh | bash -s -- cosmic-settings
+```
+
+Then log out and back in (compositor) or relaunch Settings. Each install
+backs up the existing binary to `<binary>.bak` first.
+
 This repo does **not** vendor the upstream source. It carries only:
 
 - the patch files applied on top of upstream releases,

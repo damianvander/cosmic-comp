@@ -45,6 +45,11 @@ jobs:
     # (Legs not selected on manual dispatch are skipped inside the resolve
     # step — the `matrix` context is not available in a job-level `if`.)
     runs-on: ubuntu-latest
+    # Build inside Arch so binaries link the sonames rolling-release systems
+    # (Arch/CachyOS — where COSMIC users of this repo run) actually ship;
+    # Ubuntu-built binaries want e.g. libdisplay-info.so.1 where Arch has .so.3.
+    container:
+      image: archlinux:latest
     permissions:
       contents: write   # needed to create releases
 
@@ -60,9 +65,8 @@ jobs:
             # cosmic-comp-config's local patch path is not needed for the comp build.
             needs_comp_config: false
             deps: >-
-              libudev-dev libgbm-dev libxkbcommon-dev libegl1-mesa-dev
-              libwayland-dev libinput-dev libdbus-1-dev libsystemd-dev
-              libseat-dev libdisplay-info-dev libpixman-1-dev
+              rustup base-devel mesa libglvnd libxkbcommon wayland libinput
+              dbus systemd seatd libdisplay-info pixman
           - component: cosmic-settings
             repo: https://github.com/pop-os/cosmic-settings.git
             patch: cosmic-settings-kinetic.patch
@@ -72,12 +76,15 @@ jobs:
             # patched cosmic-comp checkout — CI must lay that out (see below).
             needs_comp_config: true
             deps: >-
-              lld cmake libclang-dev libdav1d-dev libexpat1-dev
-              libfontconfig-dev libfreetype-dev libpipewire-0.3-dev
-              libpulse-dev pkg-config libxkbcommon-dev libudev-dev
-              libinput-dev libwayland-dev
+              rustup base-devel lld cmake clang dav1d expat fontconfig
+              freetype2 libpipewire libpulse libxkbcommon systemd libinput
+              wayland
 
     steps:
+      # ── 0. Tools the resolve/clone steps need inside the container ──
+      - name: Bootstrap container
+        run: pacman -Syu --noconfirm --needed git github-cli
+
       # ── 1. Checkout this patch repo (holds the .patch files) ─────────
       - name: Checkout patch repo
         uses: actions/checkout@v4
@@ -182,39 +189,35 @@ jobs:
           git -C cosmic-comp apply -3 "$GITHUB_WORKSPACE/patchrepo/cosmic-comp-kinetic.patch"
 
       # ── 4. System build dependencies ────────────────────────────────
+      # (Upstream pins the Rust version via rust-toolchain.toml; rustup
+      # auto-installs it on the first cargo invocation.)
       - name: Install system dependencies
         if: steps.resolve.outputs.should_build == 'true'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y ${{ matrix.deps }}
+        run: pacman -S --noconfirm --needed ${{ matrix.deps }}
 
-      # ── 5. Rust toolchain ───────────────────────────────────────────
-      - name: Install Rust
-        if: steps.resolve.outputs.should_build == 'true'
-        uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: stable
-
-      # ── 6. Cargo cache ──────────────────────────────────────────────
+      # ── 5. Cargo cache ──────────────────────────────────────────────
       - name: Cargo cache
         if: steps.resolve.outputs.should_build == 'true'
         uses: actions/cache@v4
         with:
           path: |
+            ~/.rustup
             ~/.cargo/registry
             ~/.cargo/git
             ${{ matrix.component }}/target
-          key: ${{ runner.os }}-${{ matrix.component }}-${{ steps.resolve.outputs.tag }}
+          key: arch-${{ matrix.component }}-${{ steps.resolve.outputs.tag }}
           restore-keys: |
-            ${{ runner.os }}-${{ matrix.component }}-
+            arch-${{ matrix.component }}-
 
-      # ── 7. Build ────────────────────────────────────────────────────
+      # ── 6. Build ────────────────────────────────────────────────────
       - name: Build release binary
         if: steps.resolve.outputs.should_build == 'true'
         working-directory: ${{ matrix.component }}
         run: cargo build ${{ matrix.build_args }}
 
-      # ── 8. Package assets ───────────────────────────────────────────
+      # ── 7. Package assets ───────────────────────────────────────────
+      # Staged in dist/ — the clone root may contain a directory named
+      # after the binary (cosmic-settings/ is the crate subdir upstream).
       - name: Package
         id: pkg
         if: steps.resolve.outputs.should_build == 'true'
@@ -223,12 +226,14 @@ jobs:
           set -euo pipefail
           BIN="target/release/${{ matrix.binary }}"
           VERSION=$("$BIN" --version 2>/dev/null || echo "unknown")
-          cp "$BIN" "${{ matrix.binary }}"
+          mkdir -p dist
+          cp "$BIN" "dist/${{ matrix.binary }}"
+          cd dist
           gzip -k "${{ matrix.binary }}"
           sha256sum "${{ matrix.binary }}.gz" "${{ matrix.binary }}" > checksums-sha256.txt
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
-      # ── 9. Publish GitHub Release ───────────────────────────────────
+      # ── 8. Publish GitHub Release ───────────────────────────────────
       - name: Create GitHub Release
         if: steps.resolve.outputs.should_build == 'true'
         uses: softprops/action-gh-release@v2
@@ -261,8 +266,8 @@ jobs:
             > Log out and back in (or restart the relevant service) for the new
             > binary to take effect.
           files: |
-            ${{ matrix.component }}/${{ matrix.binary }}.gz
-            ${{ matrix.component }}/${{ matrix.binary }}
-            ${{ matrix.component }}/checksums-sha256.txt
+            ${{ matrix.component }}/dist/${{ matrix.binary }}.gz
+            ${{ matrix.component }}/dist/${{ matrix.binary }}
+            ${{ matrix.component }}/dist/checksums-sha256.txt
           draft: false
           prerelease: false

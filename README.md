@@ -6,19 +6,18 @@ overrides**, plus a settings-app UI toggle to enable it.
 
 ## Quick install
 
-Prebuilt patched binaries (Arch/CachyOS — see [CI](#ci)), matched to your
-installed COSMIC epoch:
+Installs both patched components — the compositor (kinetic scroll engine +
+per-app scroll factors) and the settings app (UI toggles) — as prebuilt
+binaries (Arch/CachyOS — see [CI](#ci)), matched to your installed COSMIC
+epoch:
 
 ```bash
-# compositor (kinetic scroll engine + per-app scroll factors)
 curl -fsSL https://raw.githubusercontent.com/damianvander/cosmic-comp/master/install-kinetic.sh | bash
-
-# settings app (smooth-scrolling toggle + per-app scroll speed UI)
-curl -fsSL https://raw.githubusercontent.com/damianvander/cosmic-comp/master/install-kinetic.sh | bash -s -- cosmic-settings
 ```
 
-Then log out and back in (compositor) or relaunch Settings. Each install
-backs up the existing binary to `<binary>.bak` first.
+Then log out and back in. Existing binaries are backed up to `<binary>.bak`
+first. To install a single component, append `-s -- cosmic-comp` or
+`-s -- cosmic-settings` to the `bash` invocation.
 
 This repo does **not** vendor the upstream source. It carries only:
 
@@ -77,9 +76,10 @@ Prebuilt, patched binaries are published per upstream epoch as GitHub Releases
 tagged `patched-<component>-<epoch>`.
 
 ```bash
-./install-kinetic.sh                   # cosmic-comp, auto-detects your epoch
-./install-kinetic.sh cosmic-settings   # the settings app
-./install-kinetic.sh cosmic-comp epoch-1.2.0   # a specific epoch
+./install-kinetic.sh                   # both components, auto-detects your epoch
+./install-kinetic.sh cosmic-comp       # just the compositor
+./install-kinetic.sh cosmic-settings   # just the settings app
+./install-kinetic.sh epoch-1.2.0       # both, pinned to a specific epoch
 ```
 
 Log out and back in (compositor) or relaunch Settings for changes to apply.

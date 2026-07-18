@@ -79,6 +79,11 @@ Once installed:
 `.github/workflows/patch-and-build.yml` polls upstream every 6 hours (and runs
 on manual dispatch). For each component it resolves the latest `epoch-*` tag,
 skips it if already released, otherwise clones upstream at that tag, applies the
-patch, builds, and publishes a `patched-<component>-<epoch>` release. The
-cosmic-settings leg additionally lays out a patched cosmic-comp checkout so its
+patch (3-way, so minor upstream context drift self-resolves), builds, and
+publishes a `patched-<component>-<epoch>` release. The cosmic-settings leg
+additionally lays out a patched cosmic-comp checkout so its
 `cosmic-comp-config` path patch resolves.
+
+Builds run in an `archlinux:latest` container, so the published binaries link
+against current Arch sonames and run on rolling-release systems
+(Arch/CachyOS). On other distros, build from source with the patches applied.

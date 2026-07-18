@@ -1,6 +1,14 @@
 name: Patch & Build
 
 on:
+  # ── Rebuild the whole window whenever the patches (or this workflow) change ─
+  push:
+    branches: [master]
+    paths:
+      - '*.patch'
+      - 'install-kinetic.sh'
+      - '.github/workflows/patch-and-build.yml'
+
   # ── Poll upstream for new epoch tags every 6 hours ──────────────────
   schedule:
     - cron: '0 */6 * * *'
@@ -16,7 +24,7 @@ on:
       upstream_ref:
         description: >
           Epoch tag (e.g. 'epoch-1.2.0') or raw commit to build against.
-          Leave empty to build the latest epoch tag.
+          Leave empty to build the rolling window (last 3 epoch tags).
         required: false
         default: ''
       force:
@@ -40,10 +48,173 @@ jobs:
           gh api --method PUT
           repos/${{ github.repository }}/actions/workflows/patch-and-build.yml/enable
 
+  # ── Resolve the rolling window & decide what needs building ─────────
+  # For each component we track the last 3 upstream epoch-* tags. Which of
+  # those (component × tag) combos actually build depends on the trigger:
+  #   push      → all of them (patched binaries must track the latest patches)
+  #   schedule  → only combos without an existing release (new-tag catch-up)
+  #   dispatch  → upstream_ref if given, else the window; `force` skips the
+  #               release-exists check either way.
+  resolve:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      matrix: ${{ steps.resolve.outputs.matrix }}
+      has_work: ${{ steps.resolve.outputs.has_work }}
+    steps:
+      - name: Resolve window & build matrix
+        id: resolve
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          MANUAL_REF: ${{ github.event.inputs.upstream_ref }}
+          FORCE: ${{ github.event.inputs.force }}
+          SELECTED: ${{ github.event.inputs.component }}
+        run: |
+          set -euo pipefail
+
+          EVENT="$GITHUB_EVENT_NAME"
+          WINDOW=3   # how many trailing epoch tags to keep buildable
+
+          # Per-component build metadata; crossed with the resolved tags to
+          # produce one build-matrix leg per (component × tag) combo.
+          COMPONENTS="cosmic-comp cosmic-settings"
+          declare -A REPOS PATCHES BINARIES BUILD_ARGS NEEDS_CC DEPS
+
+          REPOS[cosmic-comp]="https://github.com/pop-os/cosmic-comp.git"
+          PATCHES[cosmic-comp]="cosmic-comp-kinetic.patch"
+          BINARIES[cosmic-comp]="cosmic-comp"
+          BUILD_ARGS[cosmic-comp]="--release"
+          # cosmic-comp-config's local patch path is not needed for the comp build.
+          NEEDS_CC[cosmic-comp]="false"
+          DEPS[cosmic-comp]="rustup base-devel mesa libglvnd libxkbcommon wayland libinput dbus systemd seatd libdisplay-info pixman"
+
+          REPOS[cosmic-settings]="https://github.com/pop-os/cosmic-settings.git"
+          PATCHES[cosmic-settings]="cosmic-settings-kinetic.patch"
+          BINARIES[cosmic-settings]="cosmic-settings"
+          BUILD_ARGS[cosmic-settings]="--release -p cosmic-settings"
+          # The settings patch redirects cosmic-comp-config at a sibling
+          # patched cosmic-comp checkout — the build job must lay that out.
+          NEEDS_CC[cosmic-settings]="true"
+          DEPS[cosmic-settings]="rustup base-devel lld cmake clang dav1d expat fontconfig freetype2 libpipewire libpulse libxkbcommon systemd libinput wayland"
+
+          # Epoch tags are annotated, so plain ls-remote yields the tag-object
+          # SHA; ask for the peeled (^{}) ref to get the actual commit.
+          peel_tag() {  # <repo> <tag>
+            local c
+            c=$(git ls-remote "$1" "refs/tags/$2^{}" | cut -f1)
+            [ -n "$c" ] || c=$(git ls-remote "$1" "refs/tags/$2" | cut -f1)
+            echo "$c"
+          }
+
+          release_exists() {
+            gh release view "$1" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1
+          }
+
+          matrix='[]'
+          echo "## Resolve (trigger: ${EVENT})" >> "$GITHUB_STEP_SUMMARY"
+
+          for comp in $COMPONENTS; do
+            # Skip components not selected on manual dispatch; always run all
+            # on push/schedule (SELECTED is empty there).
+            if [ -n "$SELECTED" ] && [ "$SELECTED" != "all" ] && [ "$SELECTED" != "$comp" ]; then
+              echo "$comp: not selected (component=$SELECTED) — skipping"
+              printf '\n### %s\n_Not selected (component=%s)_\n' "$comp" "$SELECTED" >> "$GITHUB_STEP_SUMMARY"
+              continue
+            fi
+
+            repo=${REPOS[$comp]}
+
+            # ── Which upstream tags to consider ──────────────────────────
+            entries=()   # each: "tag<TAB>commit"
+            if [ -n "$MANUAL_REF" ]; then
+              if [[ "$MANUAL_REF" == epoch-* ]]; then
+                commit=$(peel_tag "$repo" "$MANUAL_REF")
+                [ -z "$commit" ] && { echo "::error::Tag $MANUAL_REF not found in $repo"; exit 1; }
+                entries+=("$MANUAL_REF"$'\t'"$commit")
+              else
+                entries+=("manual-${MANUAL_REF:0:8}"$'\t'"$MANUAL_REF")
+              fi
+            else
+              # Rolling window: the last $WINDOW epoch tags (per component —
+              # the two repos' tag sets can differ).
+              window=$(git ls-remote --tags --sort=-v:refname "$repo" 'epoch-*' \
+                         | grep -v '\^{}' | head -n"$WINDOW" | sed 's|.*refs/tags/||')
+              if [ -z "$window" ]; then
+                echo "::warning::No epoch tags found in $repo"
+                printf '\n### %s\n_No epoch tags found upstream_\n' "$comp" >> "$GITHUB_STEP_SUMMARY"
+                continue
+              fi
+              for tag in $window; do
+                commit=$(peel_tag "$repo" "$tag")
+                [ -z "$commit" ] && { echo "::warning::Could not resolve $tag in $repo"; continue; }
+                entries+=("$tag"$'\t'"$commit")
+              done
+            fi
+
+            {
+              printf '\n### %s\n' "$comp"
+              echo "| Upstream tag | Commit | Release tag | Decision |"
+              echo "|---|---|---|---|"
+            } >> "$GITHUB_STEP_SUMMARY"
+
+            # ── Build/skip decision per (component, tag) ─────────────────
+            for entry in "${entries[@]}"; do
+              tag=${entry%%$'\t'*}
+              commit=${entry#*$'\t'}
+              release_tag="patched-${comp}-${tag}"
+
+              if [ "$EVENT" = "push" ]; then
+                build=true;  decision="build (patches changed — forced rebuild)"
+              elif [ "$FORCE" = "true" ]; then
+                build=true;  decision="build (force)"
+              elif release_exists "$release_tag"; then
+                build=false; decision="skip (release exists)"
+              else
+                build=true;  decision="build (no release yet)"
+              fi
+
+              echo "$comp @ $tag ($commit): $decision"
+              echo "| \`$tag\` | \`${commit:0:12}\` | \`$release_tag\` | $decision |" >> "$GITHUB_STEP_SUMMARY"
+
+              if [ "$build" = true ]; then
+                matrix=$(jq -c \
+                  --arg component "$comp" \
+                  --arg repo "$repo" \
+                  --arg patch "${PATCHES[$comp]}" \
+                  --arg binary "${BINARIES[$comp]}" \
+                  --arg build_args "${BUILD_ARGS[$comp]}" \
+                  --argjson needs_comp_config "${NEEDS_CC[$comp]}" \
+                  --arg deps "${DEPS[$comp]}" \
+                  --arg tag "$tag" \
+                  --arg commit "$commit" \
+                  --arg release_tag "$release_tag" \
+                  '. + [{component: $component, repo: $repo, patch: $patch,
+                         binary: $binary, build_args: $build_args,
+                         needs_comp_config: $needs_comp_config, deps: $deps,
+                         tag: $tag, commit: $commit, release_tag: $release_tag}]' \
+                  <<<"$matrix")
+              fi
+            done
+          done
+
+          count=$(jq 'length' <<<"$matrix")
+          has_work=false
+          [ "$count" -gt 0 ] && has_work=true
+          echo "Build matrix ($count legs): $matrix"
+
+          {
+            echo "matrix=$(jq -c '{include: .}' <<<"$matrix")"
+            echo "has_work=$has_work"
+          } >> "$GITHUB_OUTPUT"
+
+          printf '\n**%s build leg(s) queued.**\n' "$count" >> "$GITHUB_STEP_SUMMARY"
+
   build:
-    name: ${{ matrix.component }}
-    # (Legs not selected on manual dispatch are skipped inside the resolve
-    # step — the `matrix` context is not available in a job-level `if`.)
+    name: ${{ matrix.component }} @ ${{ matrix.tag }}
+    needs: resolve
+    # An empty include list would fail the job — gate on has_work instead.
+    if: needs.resolve.outputs.has_work == 'true'
     runs-on: ubuntu-latest
     # Build inside Arch so binaries link the sonames rolling-release systems
     # (Arch/CachyOS — where COSMIC users of this repo run) actually ship;
@@ -55,35 +226,12 @@ jobs:
 
     strategy:
       fail-fast: false
-      matrix:
-        include:
-          - component: cosmic-comp
-            repo: https://github.com/pop-os/cosmic-comp.git
-            patch: cosmic-comp-kinetic.patch
-            binary: cosmic-comp
-            build_args: --release
-            # cosmic-comp-config's local patch path is not needed for the comp build.
-            needs_comp_config: false
-            deps: >-
-              rustup base-devel mesa libglvnd libxkbcommon wayland libinput
-              dbus systemd seatd libdisplay-info pixman
-          - component: cosmic-settings
-            repo: https://github.com/pop-os/cosmic-settings.git
-            patch: cosmic-settings-kinetic.patch
-            binary: cosmic-settings
-            build_args: --release -p cosmic-settings
-            # The settings patch redirects cosmic-comp-config at a sibling
-            # patched cosmic-comp checkout — CI must lay that out (see below).
-            needs_comp_config: true
-            deps: >-
-              rustup base-devel lld cmake clang dav1d expat fontconfig
-              freetype2 libpipewire libpulse libxkbcommon systemd libinput
-              wayland
+      matrix: ${{ fromJSON(needs.resolve.outputs.matrix) }}
 
     steps:
-      # ── 0. Tools the resolve/clone steps need inside the container ──
+      # ── 0. Tools the clone/patch steps need inside the container ─────
       - name: Bootstrap container
-        run: pacman -Syu --noconfirm --needed git github-cli
+        run: pacman -Syu --noconfirm --needed git
 
       # ── 1. Checkout this patch repo (holds the .patch files) ─────────
       - name: Checkout patch repo
@@ -91,113 +239,40 @@ jobs:
         with:
           path: patchrepo
 
-      # ── 2. Resolve the upstream ref & decide whether to build ────────
-      - name: Resolve upstream ref
-        id: resolve
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          REPO: ${{ matrix.repo }}
-          COMPONENT: ${{ matrix.component }}
-          MANUAL_REF: ${{ github.event.inputs.upstream_ref }}
-          FORCE: ${{ github.event.inputs.force }}
-          SELECTED: ${{ github.event.inputs.component }}
-        run: |
-          set -euo pipefail
-
-          # Skip legs not selected on manual dispatch; always run all on schedule.
-          if [ -n "$SELECTED" ] && [ "$SELECTED" != "all" ] && [ "$SELECTED" != "$COMPONENT" ]; then
-            echo "$COMPONENT not selected (component=$SELECTED) — skipping"
-            echo "should_build=false" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
-          # Epoch tags are annotated, so plain ls-remote yields the tag-object
-          # SHA; ask for the peeled (^{}) ref to get the actual commit.
-          peel_tag() {
-            local c
-            c=$(git ls-remote "$REPO" "refs/tags/$1^{}" | cut -f1)
-            [ -n "$c" ] || c=$(git ls-remote "$REPO" "refs/tags/$1" | cut -f1)
-            echo "$c"
-          }
-
-          if [ -n "$MANUAL_REF" ]; then
-            if [[ "$MANUAL_REF" == epoch-* ]]; then
-              TAG="$MANUAL_REF"
-              COMMIT=$(peel_tag "$TAG")
-              [ -z "$COMMIT" ] && { echo "::error::Tag $TAG not found in $REPO"; exit 1; }
-            else
-              TAG="manual-${MANUAL_REF:0:8}"
-              COMMIT="$MANUAL_REF"
-            fi
-          else
-            TAG=$(git ls-remote --tags --sort=-v:refname "$REPO" 'epoch-*' \
-                     | grep -v '\^{}' | head -n1 | sed 's|.*refs/tags/||')
-            COMMIT=$(peel_tag "$TAG")
-            if [ -z "$TAG" ] || [ -z "$COMMIT" ]; then
-              echo "::warning::No epoch tags found in $REPO"
-              echo "should_build=false" >> "$GITHUB_OUTPUT"
-              exit 0
-            fi
-          fi
-
-          RELEASE_TAG="patched-${COMPONENT}-${TAG}"
-
-          if [ "$FORCE" != "true" ] && \
-             gh release view "$RELEASE_TAG" --repo "${{ github.repository }}" >/dev/null 2>&1; then
-            echo "Release $RELEASE_TAG already exists — skipping"
-            echo "should_build=false" >> "$GITHUB_OUTPUT"
-          else
-            echo "should_build=true" >> "$GITHUB_OUTPUT"
-          fi
-
-          echo "tag=$TAG"                 >> "$GITHUB_OUTPUT"
-          echo "commit=$COMMIT"           >> "$GITHUB_OUTPUT"
-          echo "release_tag=$RELEASE_TAG" >> "$GITHUB_OUTPUT"
-
-          {
-            echo "### ${COMPONENT}"
-            echo "- **Upstream tag:** \`$TAG\`"
-            echo "- **Commit:** \`$COMMIT\`"
-            echo "- **Release tag:** \`$RELEASE_TAG\`"
-          } >> "$GITHUB_STEP_SUMMARY"
-
-      # ── 3. Clone the upstream component at the resolved commit ───────
+      # ── 2. Clone the upstream component at the resolved commit ───────
       - name: Checkout upstream ${{ matrix.component }}
-        if: steps.resolve.outputs.should_build == 'true'
         run: |
           set -euo pipefail
           git clone "${{ matrix.repo }}" "${{ matrix.component }}"
-          git -C "${{ matrix.component }}" checkout ${{ steps.resolve.outputs.commit }}
+          git -C "${{ matrix.component }}" checkout ${{ matrix.commit }}
           # -3: fall back to a three-way merge when the patch context has
           # drifted from the tagged release; still fails on real conflicts.
           git -C "${{ matrix.component }}" apply -3 "$GITHUB_WORKSPACE/patchrepo/${{ matrix.patch }}"
-          echo "✅ Applied ${{ matrix.patch }} on ${{ steps.resolve.outputs.tag }}"
+          echo "✅ Applied ${{ matrix.patch }} on ${{ matrix.tag }}"
 
-      # ── 3b. cosmic-settings only: lay out the sibling patched
+      # ── 2b. cosmic-settings only: lay out the sibling patched
       #        cosmic-comp so its cosmic-comp-config path patch resolves ─
       - name: Prepare patched cosmic-comp-config
-        if: steps.resolve.outputs.should_build == 'true' && matrix.needs_comp_config
+        if: matrix.needs_comp_config
         run: |
           set -euo pipefail
           git clone https://github.com/pop-os/cosmic-comp.git cosmic-comp
           # Match the settings tag; fall back to master if that tag is absent.
-          if git -C cosmic-comp rev-parse -q --verify "${{ steps.resolve.outputs.tag }}^{commit}" >/dev/null; then
-            git -C cosmic-comp checkout "${{ steps.resolve.outputs.tag }}"
+          if git -C cosmic-comp rev-parse -q --verify "${{ matrix.tag }}^{commit}" >/dev/null; then
+            git -C cosmic-comp checkout "${{ matrix.tag }}"
           else
-            echo "::warning::cosmic-comp has no ${{ steps.resolve.outputs.tag }}; using master for cosmic-comp-config"
+            echo "::warning::cosmic-comp has no ${{ matrix.tag }}; using master for cosmic-comp-config"
           fi
           git -C cosmic-comp apply -3 "$GITHUB_WORKSPACE/patchrepo/cosmic-comp-kinetic.patch"
 
-      # ── 4. System build dependencies ────────────────────────────────
+      # ── 3. System build dependencies ────────────────────────────────
       # (Upstream pins the Rust version via rust-toolchain.toml; rustup
       # auto-installs it on the first cargo invocation.)
       - name: Install system dependencies
-        if: steps.resolve.outputs.should_build == 'true'
         run: pacman -S --noconfirm --needed ${{ matrix.deps }}
 
-      # ── 5. Cargo cache ──────────────────────────────────────────────
+      # ── 4. Cargo cache ──────────────────────────────────────────────
       - name: Cargo cache
-        if: steps.resolve.outputs.should_build == 'true'
         uses: actions/cache@v4
         with:
           path: |
@@ -205,22 +280,20 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             ${{ matrix.component }}/target
-          key: arch-${{ matrix.component }}-${{ steps.resolve.outputs.tag }}
+          key: arch-${{ matrix.component }}-${{ matrix.tag }}
           restore-keys: |
             arch-${{ matrix.component }}-
 
-      # ── 6. Build ────────────────────────────────────────────────────
+      # ── 5. Build ────────────────────────────────────────────────────
       - name: Build release binary
-        if: steps.resolve.outputs.should_build == 'true'
         working-directory: ${{ matrix.component }}
         run: cargo build ${{ matrix.build_args }}
 
-      # ── 7. Package assets ───────────────────────────────────────────
+      # ── 6. Package assets ───────────────────────────────────────────
       # Staged in dist/ — the clone root may contain a directory named
       # after the binary (cosmic-settings/ is the crate subdir upstream).
       - name: Package
         id: pkg
-        if: steps.resolve.outputs.should_build == 'true'
         working-directory: ${{ matrix.component }}
         run: |
           set -euo pipefail
@@ -233,21 +306,23 @@ jobs:
           sha256sum "${{ matrix.binary }}.gz" "${{ matrix.binary }}" > checksums-sha256.txt
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
-      # ── 8. Publish GitHub Release ───────────────────────────────────
+      # ── 7. Publish GitHub Release ───────────────────────────────────
+      # On forced rebuilds the tag already exists; action-gh-release then
+      # replaces the same-named assets in place, which is exactly what we
+      # want to keep binaries in sync with the latest patches.
       - name: Create GitHub Release
-        if: steps.resolve.outputs.should_build == 'true'
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ steps.resolve.outputs.release_tag }}
-          name: "${{ matrix.component }} + kinetic scrolling (${{ steps.resolve.outputs.tag }})"
+          tag_name: ${{ matrix.release_tag }}
+          name: "${{ matrix.component }} + kinetic scrolling (${{ matrix.tag }})"
           body: |
             ## Patched ${{ matrix.component }}
 
             Applies the kinetic (smooth) scrolling + per-app scroll-factor
             override patch on top of upstream
-            [`${{ steps.resolve.outputs.tag }}`](https://github.com/pop-os/${{ matrix.component }}/releases/tag/${{ steps.resolve.outputs.tag }}).
+            [`${{ matrix.tag }}`](https://github.com/pop-os/${{ matrix.component }}/releases/tag/${{ matrix.tag }}).
 
-            **Upstream commit:** `${{ steps.resolve.outputs.commit }}`
+            **Upstream commit:** `${{ matrix.commit }}`
             **Binary version:** `${{ steps.pkg.outputs.version }}`
             **Patch:** `${{ matrix.patch }}`
 

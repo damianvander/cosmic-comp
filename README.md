@@ -92,13 +92,27 @@ Once installed:
 
 ## CI
 
-`.github/workflows/patch-and-build.yml` polls upstream every 6 hours (and runs
-on manual dispatch). For each component it resolves the latest `epoch-*` tag,
-skips it if already released, otherwise clones upstream at that tag, applies the
-patch (3-way, so minor upstream context drift self-resolves), builds, and
-publishes a `patched-<component>-<epoch>` release. The cosmic-settings leg
-additionally lays out a patched cosmic-comp checkout so its
+`.github/workflows/patch-and-build.yml` maintains a **rolling window of the
+last 3 upstream `epoch-*` tags per component** (the two repos' tag sets can
+differ — the window is resolved per component), so users on slightly older
+COSMIC releases still get compatible binaries. A `resolve` job computes the
+window and which (component × tag) combos need building; a matrix `build` job
+then clones upstream at each tag, applies the patch (3-way, so minor upstream
+context drift self-resolves), builds, and publishes a
+`patched-<component>-<epoch>` release. The cosmic-settings legs additionally
+lay out a patched cosmic-comp checkout at the same tag so their
 `cosmic-comp-config` path patch resolves.
+
+Triggers:
+
+- **Push to master** (a patch, the installer, or the workflow changed):
+  rebuilds all 3 window versions for both components, force-updating existing
+  releases so the prebuilt binaries stay in sync with the latest patches.
+- **Schedule** (every 6 hours): builds only window versions that don't have a
+  release yet — when upstream tags a new epoch, the window shifts and just the
+  new version is built.
+- **Manual dispatch**: builds a specific `upstream_ref` if given, otherwise
+  applies the window logic; `force` rebuilds even where releases exist.
 
 Builds run in an `archlinux:latest` container, so the published binaries link
 against current Arch sonames and run on rolling-release systems

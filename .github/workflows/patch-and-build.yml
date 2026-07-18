@@ -62,7 +62,7 @@ jobs:
             deps: >-
               libudev-dev libgbm-dev libxkbcommon-dev libegl1-mesa-dev
               libwayland-dev libinput-dev libdbus-1-dev libsystemd-dev
-              libseat-dev libdisplay-info-dev
+              libseat-dev libdisplay-info-dev libpixman-1-dev
           - component: cosmic-settings
             repo: https://github.com/pop-os/cosmic-settings.git
             patch: cosmic-settings-kinetic.patch

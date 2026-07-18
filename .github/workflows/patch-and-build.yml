@@ -104,20 +104,28 @@ jobs:
             exit 0
           fi
 
+          # Epoch tags are annotated, so plain ls-remote yields the tag-object
+          # SHA; ask for the peeled (^{}) ref to get the actual commit.
+          peel_tag() {
+            local c
+            c=$(git ls-remote "$REPO" "refs/tags/$1^{}" | cut -f1)
+            [ -n "$c" ] || c=$(git ls-remote "$REPO" "refs/tags/$1" | cut -f1)
+            echo "$c"
+          }
+
           if [ -n "$MANUAL_REF" ]; then
             if [[ "$MANUAL_REF" == epoch-* ]]; then
               TAG="$MANUAL_REF"
-              COMMIT=$(git ls-remote "$REPO" "refs/tags/$TAG" | cut -f1)
+              COMMIT=$(peel_tag "$TAG")
               [ -z "$COMMIT" ] && { echo "::error::Tag $TAG not found in $REPO"; exit 1; }
             else
               TAG="manual-${MANUAL_REF:0:8}"
               COMMIT="$MANUAL_REF"
             fi
           else
-            LATEST=$(git ls-remote --tags --sort=-v:refname "$REPO" 'epoch-*' \
-                     | grep -v '\^{}' | head -n1)
-            TAG=$(echo "$LATEST" | sed 's|.*refs/tags/||')
-            COMMIT=$(echo "$LATEST" | cut -f1)
+            TAG=$(git ls-remote --tags --sort=-v:refname "$REPO" 'epoch-*' \
+                     | grep -v '\^{}' | head -n1 | sed 's|.*refs/tags/||')
+            COMMIT=$(peel_tag "$TAG")
             if [ -z "$TAG" ] || [ -z "$COMMIT" ]; then
               echo "::warning::No epoch tags found in $REPO"
               echo "should_build=false" >> "$GITHUB_OUTPUT"
@@ -153,7 +161,9 @@ jobs:
           set -euo pipefail
           git clone "${{ matrix.repo }}" "${{ matrix.component }}"
           git -C "${{ matrix.component }}" checkout ${{ steps.resolve.outputs.commit }}
-          git -C "${{ matrix.component }}" apply "$GITHUB_WORKSPACE/patchrepo/${{ matrix.patch }}"
+          # -3: fall back to a three-way merge when the patch context has
+          # drifted from the tagged release; still fails on real conflicts.
+          git -C "${{ matrix.component }}" apply -3 "$GITHUB_WORKSPACE/patchrepo/${{ matrix.patch }}"
           echo "✅ Applied ${{ matrix.patch }} on ${{ steps.resolve.outputs.tag }}"
 
       # ── 3b. cosmic-settings only: lay out the sibling patched
@@ -169,7 +179,7 @@ jobs:
           else
             echo "::warning::cosmic-comp has no ${{ steps.resolve.outputs.tag }}; using master for cosmic-comp-config"
           fi
-          git -C cosmic-comp apply "$GITHUB_WORKSPACE/patchrepo/cosmic-comp-kinetic.patch"
+          git -C cosmic-comp apply -3 "$GITHUB_WORKSPACE/patchrepo/cosmic-comp-kinetic.patch"
 
       # ── 4. System build dependencies ────────────────────────────────
       - name: Install system dependencies

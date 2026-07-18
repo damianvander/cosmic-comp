@@ -22,7 +22,7 @@ set -euo pipefail
 
 REPO="damianvander/cosmic-comp"          # patch repo hosting the releases
 API="https://api.github.com/repos/${REPO}/releases"
-INSTALL_DIR="/usr/bin"
+INSTALL_DIR="${INSTALL_DIR:-/usr/bin}"   # override with INSTALL_DIR=... for testing
 
 # ── Parse arguments (component + optional version selector, any order) ────────
 COMPONENT="cosmic-comp"
@@ -61,15 +61,17 @@ for cmd in curl jq gzip sha256sum; do
 done
 
 # ── Detect which upstream epoch the installed binary belongs to ───────────────
+# NB: callers capture stdout, so all logging in here must go to stderr —
+# stdout carries only the resolved epoch tag.
 detect_installed_epoch() {
-    command -v "$BINARY" > /dev/null 2>&1 || { warn "$BINARY not found in PATH"; return 1; }
+    command -v "$BINARY" > /dev/null 2>&1 || { warn "$BINARY not found in PATH" >&2; return 1; }
 
     local version_output git_hash
     version_output=$("$BINARY" --version 2>/dev/null) || return 1
     git_hash=$(echo "$version_output" | grep -oP 'git commit \K[0-9a-f]+' || true)
-    [ -z "$git_hash" ] && { warn "Could not parse git hash from: $version_output"; return 1; }
+    [ -z "$git_hash" ] && { warn "Could not parse git hash from: $version_output" >&2; return 1; }
 
-    info "Installed: ${version_output}"
+    info "Installed: ${version_output}" >&2
 
     local tags_json tag commit
     tags_json=$(curl -fsSL "https://api.github.com/repos/${UPSTREAM}/tags?per_page=100") || return 1
@@ -81,12 +83,15 @@ detect_installed_epoch() {
     return 1
 }
 
-get_release_by_tag() { curl -fsSL "${API}/tags/$1" 2>/dev/null; }
+# Both helpers print empty output on failure (404, network error) instead of
+# a non-zero exit — a failing $(…) assignment would abort the script under
+# `set -e` before any of the fallback/error paths below could run.
+get_release_by_tag() { curl -fsSL "${API}/tags/$1" 2>/dev/null || true; }
 
 # Newest release whose tag starts with patched-<component>-
 latest_component_release() {
-    curl -fsSL "${API}" | jq -c --arg p "patched-${COMPONENT}-" \
-        'map(select(.tag_name | startswith($p))) | .[0] // empty'
+    curl -fsSL "${API}" 2>/dev/null | jq -c --arg p "patched-${COMPONENT}-" \
+        'map(select(.tag_name | startswith($p))) | .[0] // empty' || true
 }
 
 # ── Resolve which release to install ──────────────────────────────────────────
@@ -104,7 +109,7 @@ elif [ -n "$SELECTOR" ]; then
     RELEASE_TAG="patched-${COMPONENT}-${TAG}"
     info "Looking for release: ${RELEASE_TAG}"
     RELEASE_JSON=$(get_release_by_tag "$RELEASE_TAG")
-    echo "$RELEASE_JSON" | jq -e '.message' > /dev/null 2>&1 && \
+    [ -z "$RELEASE_JSON" ] && \
         die "Release '${RELEASE_TAG}' not found.\n  See https://github.com/${REPO}/releases"
 
 else
@@ -113,7 +118,7 @@ else
         info "Detected epoch: ${BOLD}${EPOCH}${RESET}"
         RELEASE_TAG="patched-${COMPONENT}-${EPOCH}"
         RELEASE_JSON=$(get_release_by_tag "$RELEASE_TAG")
-        if echo "$RELEASE_JSON" | jq -e '.message' > /dev/null 2>&1; then
+        if [ -z "$RELEASE_JSON" ]; then
             warn "No patched release for ${EPOCH} — falling back to latest"
             RELEASE_JSON=$(latest_component_release)
             RELEASE_TAG=$(echo "$RELEASE_JSON" | jq -r '.tag_name // empty')
@@ -162,11 +167,14 @@ chmod +x "${TMPDIR}/${BINARY}"
 if [ -n "$CHECKSUM_URL" ]; then
     info "Verifying checksum..."
     curl -fsSL -o "${TMPDIR}/checksums-sha256.txt" "$CHECKSUM_URL"
-    EXPECTED=$(grep " ${BINARY}\$" "${TMPDIR}/checksums-sha256.txt" | awk '{print $1}')
+    EXPECTED=$(grep " ${BINARY}\$" "${TMPDIR}/checksums-sha256.txt" | awk '{print $1}' || true)
     if [ -n "$EXPECTED" ]; then
         ACTUAL=$(sha256sum "${TMPDIR}/${BINARY}" | awk '{print $1}')
-        [ "$EXPECTED" = "$ACTUAL" ] && ok "Checksum verified" \
-            || die "Checksum mismatch!\n  Expected: ${EXPECTED}\n  Got:      ${ACTUAL}"
+        if [ "$EXPECTED" = "$ACTUAL" ]; then
+            ok "Checksum verified"
+        else
+            die "Checksum mismatch!\n  Expected: ${EXPECTED}\n  Got:      ${ACTUAL}"
+        fi
     else
         warn "No matching checksum entry — skipping verification"
     fi
@@ -179,15 +187,22 @@ info "New binary: ${NEW_VERSION}"
 
 # ── Back up existing binary & install ─────────────────────────────────────────
 INSTALL_PATH="${INSTALL_DIR}/${BINARY}"
+
+# Only escalate when the target isn't writable by the current user.
+SUDO="sudo"
+if [ -w "$INSTALL_DIR" ] || { [ ! -e "$INSTALL_DIR" ] && [ -w "$(dirname "$INSTALL_DIR")" ]; }; then
+    SUDO=""
+fi
+
 if [ -f "$INSTALL_PATH" ]; then
     info "Current:   $("$INSTALL_PATH" --version 2>/dev/null || echo "unknown")"
     info "Backing up to ${INSTALL_PATH}.bak"
-    sudo cp "$INSTALL_PATH" "${INSTALL_PATH}.bak"
+    $SUDO cp "$INSTALL_PATH" "${INSTALL_PATH}.bak"
     ok "Backup saved"
 fi
 
-info "Installing to ${INSTALL_PATH} (requires sudo)..."
-sudo install -Dm0755 "${TMPDIR}/${BINARY}" "$INSTALL_PATH"
+info "Installing to ${INSTALL_PATH}${SUDO:+ (requires sudo)}..."
+$SUDO install -Dm0755 "${TMPDIR}/${BINARY}" "$INSTALL_PATH"
 ok "Installed successfully!"
 
 echo ""
